@@ -23,6 +23,10 @@ android {
 
     buildTypes {
         release {
+            // Signed with the auto-generated debug keystore so CI can produce an
+            // installable release APK without managing a production signing secret.
+            // Swap in a real keystore + Gradle signing secrets before any store distribution.
+            signingConfig = signingConfigs.getByName("debug")
             isMinifyEnabled = false
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),

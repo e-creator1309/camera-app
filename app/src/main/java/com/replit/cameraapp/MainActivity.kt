@@ -274,7 +274,7 @@ private fun CameraContent(
     // Two-finger pinch drives zoom continuously (no fixed steps) -- the zoom indicator below
     // pops up while pinching and lingers for ~2.5s after the last change before fading out,
     // instead of a permanently docked zoom row.
-    val zoomTransformableState = rememberTransformableState { _, zoomChange, _, _ ->
+    val zoomTransformableState = rememberTransformableState { zoomChange, _, _ ->
         if (zoomChange != 1f) {
             val newZoom = (zoomRatio * zoomChange).coerceIn(minZoom, maxZoom)
             zoomRatio = newZoom

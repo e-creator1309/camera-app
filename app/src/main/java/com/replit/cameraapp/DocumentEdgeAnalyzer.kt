@@ -9,6 +9,7 @@ import androidx.camera.view.PreviewView
 import androidx.compose.ui.geometry.Offset
 import kotlin.math.abs
 import kotlin.math.hypot
+import kotlin.math.max
 import kotlin.math.min
 
 /**
@@ -30,10 +31,21 @@ data class DetectedDocument(
  * Lightweight, dependency-free document/paper edge detector for [ImageAnalysis].
  *
  * There's no OpenCV or ML model here -- just a coarse luma edge map plus a corner-extremity
- * heuristic: for each of the four frame corners, find the strongest edge pixel that lies
- * furthest toward it. That's enough to reliably lock onto a high-contrast rectangular object
- * such as a sheet of paper on a desk, without pulling in a heavy native CV dependency that
- * can't be verified in this build environment.
+ * heuristic, hardened against the false positives a single-pixel version is prone to:
+ *
+ *  - a 3x3 box blur runs before edge detection, so sensor noise doesn't get picked up as an
+ *    "edge" in the first place;
+ *  - each corner is the *average* of several of the strongest nearby edge points rather than
+ *    a single most-extreme pixel, so one stray speck can't drag a corner out to the wrong spot;
+ *  - candidate quads are rejected unless they're convex and reasonably rectangular (no side
+ *    wildly longer than another), which throws out the random slivers a naive corner pick can
+ *    otherwise report as a "document"; and
+ *  - accepted corners are eased toward the previous frame's corners (light temporal smoothing)
+ *    so the outline doesn't jitter or snap between frames.
+ *
+ * That's enough to reliably lock onto a high-contrast rectangular object such as a sheet of
+ * paper or a book cover on a desk, without pulling in a heavy native CV dependency that can't
+ * be verified in this build environment.
  */
 class DocumentEdgeAnalyzer(
     private val previewView: PreviewView,
@@ -43,6 +55,10 @@ class DocumentEdgeAnalyzer(
     private val gridWidth = 120
     private val gridHeight = 160
     private var lastAnalyzedAt = 0L
+
+    // Corners (in analysis-buffer pixel space) from the last accepted detection, used to ease
+    // each new detection toward instead of snapping straight to it.
+    private var smoothedCorners: List<PointF>? = null
 
     override fun analyze(image: ImageProxy) {
         val now = System.currentTimeMillis()
@@ -70,7 +86,7 @@ class DocumentEdgeAnalyzer(
         val pixelStride = plane.pixelStride
         val cropW = cropRect.width()
         val cropH = cropRect.height()
-        if (cropW <= 0 || cropH <= 0) return null
+        if (cropW <= 0 || cropH <= 0) return fail()
 
         // Sample a coarse grid of luma values directly from the analysis buffer's Y plane.
         val gray = ByteArray(gridWidth * gridHeight)
@@ -84,16 +100,20 @@ class DocumentEdgeAnalyzer(
             }
         }
 
+        // Light denoise before edge detection -- without this, isolated noisy pixels near the
+        // frame edge were the main cause of the outline snapping to the wrong place.
+        val blurred = boxBlur3x3(gray)
+
         // Simple gradient-magnitude edge map (difference vs. right/below neighbor).
-        val edgeThreshold = 28
+        val edgeThreshold = 24
         val margin = 4 // ignore a thin border, where lens vignetting/noise causes false edges
         val edgeXs = ArrayList<Int>()
         val edgeYs = ArrayList<Int>()
         for (gy in margin until gridHeight - margin - 1) {
             for (gx in margin until gridWidth - margin - 1) {
-                val here = gray[gy * gridWidth + gx].toInt() and 0xFF
-                val right = gray[gy * gridWidth + gx + 1].toInt() and 0xFF
-                val below = gray[(gy + 1) * gridWidth + gx].toInt() and 0xFF
+                val here = blurred[gy * gridWidth + gx].toInt() and 0xFF
+                val right = blurred[gy * gridWidth + gx + 1].toInt() and 0xFF
+                val below = blurred[(gy + 1) * gridWidth + gx].toInt() and 0xFF
                 val gradient = abs(here - right) + abs(here - below)
                 if (gradient > edgeThreshold) {
                     edgeXs.add(gx)
@@ -104,59 +124,136 @@ class DocumentEdgeAnalyzer(
 
         // Too few edges -- nothing resembling a document in frame.
         val minEdgePixels = (gridWidth * gridHeight) / 60
-        if (edgeXs.size < minEdgePixels) return null
+        if (edgeXs.size < minEdgePixels) return fail()
 
-        // For each frame corner, pick the edge pixel that pushes furthest toward it.
-        var bestTL = -1; var bestTLScore = Int.MAX_VALUE
-        var bestTR = -1; var bestTRScore = Int.MIN_VALUE
-        var bestBL = -1; var bestBLScore = Int.MIN_VALUE
-        var bestBR = -1; var bestBRScore = Int.MIN_VALUE
-
-        for (i in edgeXs.indices) {
-            val x = edgeXs[i]; val y = edgeYs[i]
-            val sumScore = x + y   // minimized at top-left, maximized at bottom-right
-            val diffScore = x - y  // maximized at top-right, minimized at bottom-left
-
-            if (sumScore < bestTLScore) { bestTLScore = sumScore; bestTL = i }
-            if (sumScore > bestBRScore) { bestBRScore = sumScore; bestBR = i }
-            if (diffScore > bestTRScore) { bestTRScore = diffScore; bestTR = i }
-            if (diffScore < bestBLScore) { bestBLScore = diffScore; bestBL = i }
-        }
-        if (bestTL < 0 || bestTR < 0 || bestBL < 0 || bestBR < 0) return null
-
-        // Map a grid index back to real pixel coordinates in the analysis buffer's own
-        // (cropped) coordinate space -- the same space image.cropRect lives in.
-        fun toBufferPoint(index: Int): PointF {
-            val gx = edgeXs[index]; val gy = edgeYs[index]
-            return PointF(
-                cropRect.left + gx * cropW / gridWidth.toFloat(),
-                cropRect.top + gy * cropH / gridHeight.toFloat()
-            )
+        // For each frame corner, average the strongest handful of edge points that push
+        // furthest toward it, rather than trusting a single most-extreme pixel.
+        val topK = 8
+        val topLeftGrid = averageExtremePoint(edgeXs, edgeYs, topK) { x, y -> -(x + y) }
+        val topRightGrid = averageExtremePoint(edgeXs, edgeYs, topK) { x, y -> x - y }
+        val bottomRightGrid = averageExtremePoint(edgeXs, edgeYs, topK) { x, y -> x + y }
+        val bottomLeftGrid = averageExtremePoint(edgeXs, edgeYs, topK) { x, y -> y - x }
+        if (topLeftGrid == null || topRightGrid == null || bottomRightGrid == null || bottomLeftGrid == null) {
+            return fail()
         }
 
-        val topLeft = toBufferPoint(bestTL)
-        val topRight = toBufferPoint(bestTR)
-        val bottomRight = toBufferPoint(bestBR)
-        val bottomLeft = toBufferPoint(bestBL)
+        fun toBufferPoint(grid: PointF): PointF = PointF(
+            cropRect.left + grid.x * cropW / gridWidth.toFloat(),
+            cropRect.top + grid.y * cropH / gridHeight.toFloat()
+        )
 
-        // Sanity checks: the four corners must form a reasonably sized, non-degenerate quad,
-        // otherwise noisy scenes with no real document would constantly "detect" garbage.
+        val topLeft = toBufferPoint(topLeftGrid)
+        val topRight = toBufferPoint(topRightGrid)
+        val bottomRight = toBufferPoint(bottomRightGrid)
+        val bottomLeft = toBufferPoint(bottomLeftGrid)
+
+        // Sanity checks: the four corners must form a reasonably sized, convex,
+        // roughly-rectangular quad, otherwise noisy scenes with no real document would
+        // constantly "detect" garbage (this is what used to produce a stray rectangle
+        // nowhere near the actual paper/book).
         val quadArea = quadrilateralArea(topLeft, topRight, bottomRight, bottomLeft)
         val frameArea = cropW.toFloat() * cropH.toFloat()
         val areaRatio = quadArea / frameArea
-        if (areaRatio < 0.12f || areaRatio > 0.97f) return null
+        if (areaRatio < 0.12f || areaRatio > 0.97f) return fail()
 
-        val minSide = min(
-            min(distance(topLeft, topRight), distance(topRight, bottomRight)),
-            min(distance(bottomRight, bottomLeft), distance(bottomLeft, topLeft))
-        )
-        if (minSide < cropW * 0.08f) return null
+        val topSide = distance(topLeft, topRight)
+        val rightSide = distance(topRight, bottomRight)
+        val bottomSide = distance(bottomRight, bottomLeft)
+        val leftSide = distance(bottomLeft, topLeft)
+        val minSide = min(min(topSide, rightSide), min(bottomSide, leftSide))
+        val maxSide = max(max(topSide, rightSide), max(bottomSide, leftSide))
+        if (minSide < cropW * 0.08f) return fail()
+        // A real sheet of paper or book cover doesn't have one side wildly longer than
+        // another -- reject thin slivers this heuristic would otherwise happily box up.
+        if (maxSide / minSide > 3.2f) return fail()
+        if (!isConvexQuad(topLeft, topRight, bottomRight, bottomLeft)) return fail()
 
-        val corners = listOf(topLeft, topRight, bottomRight, bottomLeft)
-        val previewPoints = mapToPreviewSpace(corners, cropRect, image.imageInfo.rotationDegrees) ?: return null
+        val rawCorners = listOf(topLeft, topRight, bottomRight, bottomLeft)
+        val previous = smoothedCorners
+        val corners = if (previous != null && previous.size == 4) {
+            rawCorners.mapIndexed { i, p ->
+                PointF(
+                    previous[i].x + (p.x - previous[i].x) * 0.4f,
+                    previous[i].y + (p.y - previous[i].y) * 0.4f
+                )
+            }
+        } else {
+            rawCorners
+        }
+        smoothedCorners = corners
+
+        val previewPoints = mapToPreviewSpace(corners, cropRect, image.imageInfo.rotationDegrees) ?: return fail()
         val normalizedCorners = normalizeUpright(corners, cropRect, image.imageInfo.rotationDegrees)
 
         return DetectedDocument(previewPoints, normalizedCorners)
+    }
+
+    /** Clears the smoothing baseline so the next real detection doesn't ease in from a stale spot. */
+    private fun fail(): DetectedDocument? {
+        smoothedCorners = null
+        return null
+    }
+
+    /** 3x3 box blur over the coarse luma grid, used to suppress single-pixel noise before edge detection. */
+    private fun boxBlur3x3(src: ByteArray): ByteArray {
+        val out = ByteArray(src.size)
+        for (gy in 0 until gridHeight) {
+            for (gx in 0 until gridWidth) {
+                var sum = 0
+                var count = 0
+                for (dy in -1..1) {
+                    val ny = gy + dy
+                    if (ny < 0 || ny >= gridHeight) continue
+                    for (dx in -1..1) {
+                        val nx = gx + dx
+                        if (nx < 0 || nx >= gridWidth) continue
+                        sum += src[ny * gridWidth + nx].toInt() and 0xFF
+                        count++
+                    }
+                }
+                out[gy * gridWidth + gx] = (sum / count).toByte()
+            }
+        }
+        return out
+    }
+
+    /**
+     * Averages the coordinates of the [topK] edge points that score highest under [score],
+     * in grid space. Used instead of a single argmax pick so one noisy outlier pixel can't
+     * single-handedly relocate a corner.
+     */
+    private fun averageExtremePoint(
+        xs: List<Int>,
+        ys: List<Int>,
+        topK: Int,
+        score: (Int, Int) -> Int
+    ): PointF? {
+        if (xs.isEmpty()) return null
+        val indices = xs.indices.sortedByDescending { score(xs[it], ys[it]) }
+        val take = indices.take(topK.coerceAtMost(indices.size))
+        var sumX = 0f
+        var sumY = 0f
+        for (i in take) {
+            sumX += xs[i]
+            sumY += ys[i]
+        }
+        return PointF(sumX / take.size, sumY / take.size)
+    }
+
+    /** Convex-polygon test via cross-product sign consistency around the four vertices in order. */
+    private fun isConvexQuad(a: PointF, b: PointF, c: PointF, d: PointF): Boolean {
+        val pts = listOf(a, b, c, d)
+        var sign = 0
+        for (i in pts.indices) {
+            val p0 = pts[i]
+            val p1 = pts[(i + 1) % pts.size]
+            val p2 = pts[(i + 2) % pts.size]
+            val cross = (p1.x - p0.x) * (p2.y - p1.y) - (p1.y - p0.y) * (p2.x - p1.x)
+            val current = if (cross > 0) 1 else if (cross < 0) -1 else 0
+            if (current == 0) continue
+            if (sign == 0) sign = current else if (current != sign) return false
+        }
+        return sign != 0
     }
 
     /**

@@ -9,9 +9,12 @@ import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas as AndroidCanvas
+import android.graphics.ColorMatrix as AndroidColorMatrix
+import android.graphics.ColorMatrixColorFilter
 import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.PointF
+import android.graphics.RenderEffect as AndroidRenderEffect
 import android.net.Uri
 import android.os.Bundle
 import android.provider.MediaStore
@@ -58,8 +61,10 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -69,6 +74,7 @@ import androidx.compose.material.icons.filled.Cameraswitch
 import androidx.compose.material.icons.filled.CropFree
 import androidx.compose.material.icons.filled.FlashOff
 import androidx.compose.material.icons.filled.FlashOn
+import androidx.compose.material.icons.filled.PhotoFilter
 import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Timer
@@ -93,10 +99,14 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.graphicsLayer
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.RenderEffect
+import androidx.compose.ui.graphics.asComposeRenderEffect
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Fill
 import androidx.compose.ui.graphics.drawscope.Stroke
@@ -126,6 +136,10 @@ private const val SAMSUNG_GALLERY_PACKAGE = "com.sec.android.gallery3d"
 
 private val TIMER_OPTIONS = listOf(0, 3, 10)
 
+/** Quick-select zoom levels shown as tap targets, in addition to continuous pinch-to-zoom.
+ *  Filtered per-device to whatever range the current camera actually supports. */
+private val ZOOM_PRESETS = listOf(0.5f, 1f, 2f, 5f, 10f)
+
 /** How long the front camera's simulated screen-flash stays lit before the shutter fires. */
 private const val FRONT_FLASH_DURATION_MS = 1000L
 
@@ -137,6 +151,17 @@ private enum class CaptureAspect(val label: String) {
     RATIO_16_9("16:9");
 
     fun next(): CaptureAspect = entries[(ordinal + 1) % entries.size]
+}
+
+/** Live preview color filters, applied as a real-time [RenderEffect] on the camera feed. */
+private enum class PhotoFilter(val label: String) {
+    NONE("None"),
+    MONO("Mono"),
+    WARM("Warm"),
+    COOL("Cool"),
+    VIVID("Vivid");
+
+    fun next(): PhotoFilter = entries[(ordinal + 1) % entries.size]
 }
 
 /** Which full-screen page is currently shown over the camera preview. */
@@ -259,6 +284,7 @@ private fun CameraContent(
     var isBusy by remember { mutableStateOf(false) }
     var frontFlashActive by remember { mutableStateOf(false) }
     var captureAspect by remember { mutableStateOf(CaptureAspect.FULL) }
+    var photoFilter by remember { mutableStateOf(PhotoFilter.NONE) }
     var detectedDocument by remember { mutableStateOf<DetectedDocument?>(null) }
     var zoomIndicatorPulse by remember { mutableIntStateOf(0) }
     var zoomIndicatorVisible by remember { mutableStateOf(false) }
@@ -273,7 +299,8 @@ private fun CameraContent(
 
     // Two-finger pinch drives zoom continuously (no fixed steps) -- the zoom indicator below
     // pops up while pinching and lingers for ~2.5s after the last change before fading out,
-    // instead of a permanently docked zoom row.
+    // instead of a permanently docked zoom row. A row of tap-to-select presets (0.5x-10x,
+    // see ZoomPresetRow) sits alongside it for quick, discoverable jumps.
     val zoomTransformableState = rememberTransformableState { zoomChange, _, _ ->
         if (zoomChange != 1f) {
             val newZoom = (zoomRatio * zoomChange).coerceIn(minZoom, maxZoom)
@@ -294,7 +321,14 @@ private fun CameraContent(
     var imageCapture by remember {
         mutableStateOf(buildImageCapture(CaptureAspect.FULL))
     }
-    val previewView = remember { PreviewView(context) }
+    // COMPATIBLE (TextureView-backed) mode is required so the live preview actually
+    // participates in Compose's own rendering layer -- that's what lets the filter
+    // RenderEffect below draw over the real camera pixels instead of being ignored.
+    val previewView = remember {
+        PreviewView(context).apply {
+            implementationMode = PreviewView.ImplementationMode.COMPATIBLE
+        }
+    }
     val documentAnalysisExecutor = remember { Executors.newSingleThreadExecutor() }
 
     DisposableEffect(Unit) {
@@ -370,10 +404,13 @@ private fun CameraContent(
         scope.launch {
             isBusy = true
             try {
-                // Self-timer countdown, shown full-screen before the shutter fires.
+                // Self-timer countdown, shown full-screen before the shutter fires. Each
+                // second gets its own haptic tick so the countdown is felt, not just seen --
+                // makes it unmistakable that the timer button actually did something.
                 if (timerSeconds > 0) {
                     for (secondsLeft in timerSeconds downTo 1) {
                         countdownValue = secondsLeft
+                        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                         delay(1000)
                     }
                     countdownValue = 0
@@ -430,12 +467,20 @@ private fun CameraContent(
     }
 
     Box(modifier = Modifier.fillMaxSize()) {
-        AndroidView(
-            factory = { previewView },
+        Box(
             modifier = Modifier
                 .fillMaxSize()
                 .transformable(state = zoomTransformableState)
-        )
+                .graphicsLayer(
+                    compositingStrategy = CompositingStrategy.Offscreen,
+                    renderEffect = rememberFilterEffect(photoFilter)
+                )
+        ) {
+            AndroidView(
+                factory = { previewView },
+                modifier = Modifier.fillMaxSize()
+            )
+        }
 
         DocumentScanOverlay(
             document = if (scanActive) detectedDocument else null,
@@ -460,15 +505,20 @@ private fun CameraContent(
 
         if (scanDocumentsEnabled) {
             DocumentScanBadge(
-                modifier = Modifier.align(Alignment.TopCenter).padding(top = 20.dp),
+                modifier = Modifier.align(Alignment.TopCenter).statusBarsPadding().padding(top = 12.dp),
                 scanActive = scanActive,
                 documentDetected = detectedDocument != null
             )
         }
 
-        // Top-right: settings, timer, and flash toggle all together in one row, beside the flash icon.
+        // Top-right: settings, timer, filter, and flash toggle all together in one row.
+        // statusBarsPadding() keeps this row clear of the status bar's network/battery icons
+        // on edge-to-edge displays, with a little extra room below that.
         Row(
-            modifier = Modifier.align(Alignment.TopEnd).padding(top = 20.dp, end = 20.dp),
+            modifier = Modifier
+                .align(Alignment.TopEnd)
+                .statusBarsPadding()
+                .padding(top = 12.dp, end = 20.dp),
             horizontalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             PressableIconButton(
@@ -487,10 +537,41 @@ private fun CameraContent(
                     timerSeconds = TIMER_OPTIONS[(currentIndex + 1) % TIMER_OPTIONS.size]
                 }
             ) {
+                Box(contentAlignment = Alignment.Center) {
+                    Icon(
+                        imageVector = if (timerSeconds > 0) Icons.Filled.Timer else Icons.Filled.TimerOff,
+                        contentDescription = "Self-timer: ${if (timerSeconds > 0) "${timerSeconds}s" else "off"}",
+                        tint = if (timerSeconds > 0) Color(0xFFFFD54F) else Color.White
+                    )
+                    // The armed duration shown right on the icon -- makes it obvious the
+                    // timer button actually does something, not just changes color.
+                    if (timerSeconds > 0) {
+                        Text(
+                            text = timerSeconds.toString(),
+                            color = Color.Black,
+                            fontSize = 9.sp,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier
+                                .align(Alignment.BottomEnd)
+                                .offset(x = 3.dp, y = 3.dp)
+                                .clip(CircleShape)
+                                .background(Color(0xFFFFD54F))
+                                .padding(horizontal = 3.dp, vertical = 1.dp)
+                        )
+                    }
+                }
+            }
+
+            PressableIconButton(
+                onClick = {
+                    haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                    photoFilter = photoFilter.next()
+                }
+            ) {
                 Icon(
-                    imageVector = if (timerSeconds > 0) Icons.Filled.Timer else Icons.Filled.TimerOff,
-                    contentDescription = "Self-timer: ${if (timerSeconds > 0) "${timerSeconds}s" else "off"}",
-                    tint = if (timerSeconds > 0) Color(0xFFFFD54F) else Color.White
+                    imageVector = Icons.Filled.PhotoFilter,
+                    contentDescription = "Filter: ${photoFilter.label}",
+                    tint = if (photoFilter != PhotoFilter.NONE) SamsungBlue else Color.White
                 )
             }
 
@@ -549,6 +630,23 @@ private fun CameraContent(
                 .padding(bottom = 56.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
+            // Tap-to-select zoom presets (0.5x ultra-wide through 10x), filtered to whatever
+            // range this device's camera actually supports -- quicker and more discoverable
+            // than pinch-only zoom, which is kept as well for fine continuous control.
+            ZoomPresetRow(
+                current = zoomRatio,
+                minZoom = minZoom,
+                maxZoom = maxZoom,
+                onSelect = { level ->
+                    haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                    val newZoom = level.coerceIn(minZoom, maxZoom)
+                    zoomRatio = newZoom
+                    camera?.cameraControl?.setZoomRatio(newZoom)
+                    zoomIndicatorPulse += 1
+                },
+                modifier = Modifier.padding(bottom = 14.dp)
+            )
+
             AspectRatioSelector(
                 current = captureAspect,
                 onSelect = { captureAspect = it }
@@ -591,6 +689,43 @@ private fun buildImageCapture(aspect: CaptureAspect): ImageCapture {
     return builder.build()
 }
 
+/**
+ * Builds the live-preview color filter as a real [RenderEffect], applied via
+ * `Modifier.graphicsLayer`. `minSdk` for this app is 31, so `RenderEffect` (added in API 31)
+ * is always available -- no version gating needed. Filters are preview-only; they aren't
+ * baked into the saved JPEG.
+ */
+@Composable
+private fun rememberFilterEffect(filter: PhotoFilter): RenderEffect? {
+    if (filter == PhotoFilter.NONE) return null
+    return remember(filter) {
+        val matrix = when (filter) {
+            PhotoFilter.MONO -> AndroidColorMatrix().apply { setSaturation(0f) }
+            PhotoFilter.WARM -> AndroidColorMatrix(
+                floatArrayOf(
+                    1.12f, 0f, 0f, 0f, 14f,
+                    0f, 1.03f, 0f, 0f, 4f,
+                    0f, 0f, 0.86f, 0f, -10f,
+                    0f, 0f, 0f, 1f, 0f
+                )
+            )
+            PhotoFilter.COOL -> AndroidColorMatrix(
+                floatArrayOf(
+                    0.90f, 0f, 0f, 0f, -6f,
+                    0f, 0.97f, 0f, 0f, 0f,
+                    0f, 0f, 1.16f, 0f, 16f,
+                    0f, 0f, 0f, 1f, 0f
+                )
+            )
+            PhotoFilter.VIVID -> AndroidColorMatrix().apply { setSaturation(1.55f) }
+            PhotoFilter.NONE -> AndroidColorMatrix() // unreachable -- guarded above
+        }
+        AndroidRenderEffect
+            .createColorFilterEffect(ColorMatrixColorFilter(matrix))
+            .asComposeRenderEffect()
+    }
+}
+
 /** Draws a live outline over a document/paper detected by [DocumentEdgeAnalyzer], if any. */
 @Composable
 private fun DocumentScanOverlay(document: DetectedDocument?, modifier: Modifier = Modifier) {
@@ -617,6 +752,10 @@ private fun DocumentScanBadge(
     scanActive: Boolean,
     documentDetected: Boolean
 ) {
+    // No title while it's just quietly scanning -- only speak up once a document is actually
+    // found, or to explain why nothing is happening when the front camera is active.
+    if (scanActive && !documentDetected) return
+
     Row(
         modifier = modifier
             .clip(RoundedCornerShape(50))
@@ -632,11 +771,7 @@ private fun DocumentScanBadge(
             modifier = Modifier.size(16.dp)
         )
         Text(
-            text = when {
-                !scanActive -> "Switch to back camera to scan"
-                documentDetected -> "Document detected"
-                else -> "Scanning for documents"
-            },
+            text = if (documentDetected) "Document detected" else "Switch to back camera to scan",
             color = Color.White,
             fontSize = 12.sp,
             fontWeight = FontWeight.Medium
@@ -664,6 +799,58 @@ private fun AspectRatioSelector(current: CaptureAspect, onSelect: (CaptureAspect
         Text(text = current.label, color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Medium)
     }
 }
+
+/**
+ * Tap-to-select row of zoom presets (0.5x through 10x), filtered to the levels this device's
+ * camera actually supports. Complements continuous pinch-to-zoom with quick, discoverable jumps
+ * to a specific lens/zoom level, the way stock camera apps expose their lens switcher.
+ */
+@Composable
+private fun ZoomPresetRow(
+    current: Float,
+    minZoom: Float,
+    maxZoom: Float,
+    onSelect: (Float) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val available = remember(minZoom, maxZoom) {
+        val eps = 0.05f
+        val levels = ZOOM_PRESETS.filter { it >= minZoom - eps && it <= maxZoom + eps }.toMutableSet()
+        levels.add(1f.coerceIn(minZoom, maxZoom))
+        levels.filter { it in (minZoom - eps)..(maxZoom + eps) }.sorted()
+    }
+    if (available.size < 2) return
+
+    Row(
+        modifier = modifier
+            .clip(RoundedCornerShape(50))
+            .background(Color.Black.copy(alpha = 0.35f))
+            .padding(horizontal = 6.dp, vertical = 6.dp),
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        available.forEach { level ->
+            val isActive = kotlin.math.abs(current - level) < 0.15f
+            Box(
+                modifier = Modifier
+                    .clip(CircleShape)
+                    .background(if (isActive) SamsungBlue else Color.Transparent)
+                    .clickable { onSelect(level) }
+                    .padding(horizontal = 10.dp, vertical = 6.dp)
+            ) {
+                Text(
+                    text = formatZoomLabel(level),
+                    color = Color.White,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+        }
+    }
+}
+
+private fun formatZoomLabel(level: Float): String =
+    if (level < 1f) String.format(Locale.US, "%.1fx", level) else "${level.roundToInt()}x"
 
 /**
  * Transient pinch-to-zoom readout: a vertical track that fills up to the current zoom

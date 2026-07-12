@@ -8,21 +8,31 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Canvas as AndroidCanvas
+import android.graphics.Matrix
+import android.graphics.Paint
+import android.graphics.PointF
 import android.net.Uri
 import android.os.Bundle
 import android.provider.MediaStore
 import android.util.Log
+import android.util.Rational
 import android.view.KeyEvent
+import android.view.Surface as AndroidSurface
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.AspectRatio
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
+import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.Preview
+import androidx.camera.core.UseCaseGroup
+import androidx.camera.core.ViewPort
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.animation.AnimatedVisibility
@@ -30,6 +40,7 @@ import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -46,12 +57,12 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AspectRatio as AspectRatioIcon
 import androidx.compose.material.icons.filled.Cameraswitch
+import androidx.compose.material.icons.filled.CropFree
 import androidx.compose.material.icons.filled.FlashOff
 import androidx.compose.material.icons.filled.FlashOn
 import androidx.compose.material.icons.filled.PhotoLibrary
@@ -81,7 +92,10 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.drawscope.Fill
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
@@ -99,6 +113,7 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.concurrent.Executor
+import java.util.concurrent.Executors
 import kotlin.coroutines.resume
 import kotlin.math.roundToInt
 
@@ -120,6 +135,9 @@ private enum class CaptureAspect(val label: String) {
 
     fun next(): CaptureAspect = entries[(ordinal + 1) % entries.size]
 }
+
+/** Which full-screen page is currently shown over the camera preview. */
+private enum class Screen { CAMERA, SETTINGS }
 
 class MainActivity : ComponentActivity() {
 
@@ -180,9 +198,32 @@ private fun CameraScreen() {
         }
     }
 
+    var screen by remember { mutableStateOf(Screen.CAMERA) }
+    var scanDocumentsEnabled by remember { mutableStateOf(SettingsPreferences.isScanDocumentsEnabled(context)) }
+
+    BackHandler(enabled = screen == Screen.SETTINGS) { screen = Screen.CAMERA }
+
     Surface(modifier = Modifier.fillMaxSize(), color = Color.Black) {
         if (hasCameraPermission) {
-            CameraContent()
+            Box(modifier = Modifier.fillMaxSize()) {
+                // The camera stays composed (and bound) underneath Settings, so zoom, flash,
+                // timer, and the last-photo thumbnail aren't reset just from opening the gear menu.
+                CameraContent(
+                    scanDocumentsEnabled = scanDocumentsEnabled,
+                    onOpenSettings = { screen = Screen.SETTINGS }
+                )
+
+                if (screen == Screen.SETTINGS) {
+                    SettingsScreen(
+                        scanDocumentsEnabled = scanDocumentsEnabled,
+                        onScanDocumentsChanged = { enabled ->
+                            scanDocumentsEnabled = enabled
+                            SettingsPreferences.setScanDocumentsEnabled(context, enabled)
+                        },
+                        onBack = { screen = Screen.CAMERA }
+                    )
+                }
+            }
         } else {
             PermissionRationale(onRequestPermission = {
                 permissionLauncher.launch(Manifest.permission.CAMERA)
@@ -192,7 +233,10 @@ private fun CameraScreen() {
 }
 
 @Composable
-private fun CameraContent() {
+private fun CameraContent(
+    scanDocumentsEnabled: Boolean,
+    onOpenSettings: () -> Unit
+) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val haptics = LocalHapticFeedback.current
@@ -212,13 +256,26 @@ private fun CameraContent() {
     var isBusy by remember { mutableStateOf(false) }
     var frontFlashActive by remember { mutableStateOf(false) }
     var captureAspect by remember { mutableStateOf(CaptureAspect.FULL) }
+    var detectedDocument by remember { mutableStateOf<DetectedDocument?>(null) }
+
+    // Document scanning only runs on the back camera -- the front camera's mirrored preview
+    // would need its own coordinate handling, and scanning a document via selfie camera isn't
+    // a real use case, so this keeps the feature simple and correct rather than half-right.
+    val scanActive = scanDocumentsEnabled && lensFacing == CameraSelector.LENS_FACING_BACK
 
     var imageCapture by remember {
         mutableStateOf(buildImageCapture(CaptureAspect.FULL))
     }
     val previewView = remember { PreviewView(context) }
+    val documentAnalysisExecutor = remember { Executors.newSingleThreadExecutor() }
 
-    LaunchedEffect(lensFacing, captureAspect) {
+    DisposableEffect(Unit) {
+        onDispose { documentAnalysisExecutor.shutdown() }
+    }
+
+    LaunchedEffect(lensFacing, captureAspect, scanDocumentsEnabled) {
+        detectedDocument = null
+
         val cameraProvider = context.getCameraProvider()
         val preview = Preview.Builder().build().also {
             it.setSurfaceProvider(previewView.surfaceProvider)
@@ -226,9 +283,38 @@ private fun CameraContent() {
         val cameraSelector = CameraSelector.Builder().requireLensFacing(lensFacing).build()
         val newImageCapture = buildImageCapture(captureAspect)
 
+        val scanForThisBind = scanDocumentsEnabled && lensFacing == CameraSelector.LENS_FACING_BACK
+        val imageAnalysis = if (scanForThisBind) {
+            ImageAnalysis.Builder()
+                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .build()
+                .also { analysis ->
+                    analysis.setAnalyzer(
+                        documentAnalysisExecutor,
+                        DocumentEdgeAnalyzer(previewView) { result -> detectedDocument = result }
+                    )
+                }
+        } else {
+            null
+        }
+
+        val useCaseGroupBuilder = UseCaseGroup.Builder()
+        useCaseGroupBuilder.addUseCase(preview)
+        useCaseGroupBuilder.addUseCase(newImageCapture)
+        imageAnalysis?.let { useCaseGroupBuilder.addUseCase(it) }
+
+        // A shared ViewPort keeps the analysis, preview, and capture crop rects aligned to the
+        // same field of view, which is what makes the live document outline line up correctly.
+        if (previewView.width > 0 && previewView.height > 0) {
+            val rotation = previewView.display?.rotation ?: AndroidSurface.ROTATION_0
+            useCaseGroupBuilder.setViewPort(
+                ViewPort.Builder(Rational(previewView.width, previewView.height), rotation).build()
+            )
+        }
+
         cameraProvider.unbindAll()
         try {
-            camera = cameraProvider.bindToLifecycle(lifecycleOwner, cameraSelector, preview, newImageCapture)
+            camera = cameraProvider.bindToLifecycle(lifecycleOwner, cameraSelector, useCaseGroupBuilder.build())
             imageCapture = newImageCapture
             flashOn = false
             zoomRatio = 1f
@@ -285,6 +371,7 @@ private fun CameraContent() {
                     ImageCapture.FLASH_MODE_OFF
                 }
 
+                val documentCorners = detectedDocument?.normalizedCorners
                 val uri = capturePhoto(context, imageCapture, mainExecutor, captureAspect)
 
                 if (useFrontScreenFlash) {
@@ -292,6 +379,11 @@ private fun CameraContent() {
                 }
 
                 if (uri != null) {
+                    // If a document was framed at the moment of capture, straighten and crop
+                    // to it -- "Full" only, so it doesn't fight with the 4:3/1:1/16:9 crops.
+                    if (scanActive && captureAspect == CaptureAspect.FULL && documentCorners != null) {
+                        applyDocumentScanCrop(context, uri, documentCorners)
+                    }
                     lastPhotoUri = uri
                     capturedPop = true
                 }
@@ -312,6 +404,11 @@ private fun CameraContent() {
     Box(modifier = Modifier.fillMaxSize()) {
         AndroidView(factory = { previewView }, modifier = Modifier.fillMaxSize())
 
+        DocumentScanOverlay(
+            document = if (scanActive) detectedDocument else null,
+            modifier = Modifier.fillMaxSize()
+        )
+
         // Frozen still of the last preview frame, shown briefly after a capture so the
         // user can tell a photo was taken -- no white flash, just a short, calm pause.
         freezeFrame?.let { bitmap ->
@@ -328,15 +425,23 @@ private fun CameraContent() {
             Box(modifier = Modifier.fillMaxSize().background(Color.White))
         }
 
-        // Top-left: settings gear, reserved for future options.
+        // Top-left: settings gear, opens the full settings page.
         PressableIconButton(
             modifier = Modifier.align(Alignment.TopStart).padding(top = 20.dp, start = 20.dp),
             onClick = {
                 haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                // Placeholder for now -- settings menu content comes in a later pass.
+                onOpenSettings()
             }
         ) {
             Icon(Icons.Filled.Settings, contentDescription = "Settings", tint = Color.White)
+        }
+
+        if (scanDocumentsEnabled) {
+            DocumentScanBadge(
+                modifier = Modifier.align(Alignment.TopCenter).padding(top = 20.dp),
+                scanActive = scanActive,
+                documentDetected = detectedDocument != null
+            )
         }
 
         // Top-right: timer + flash toggle, side by side.
@@ -457,6 +562,59 @@ private fun buildImageCapture(aspect: CaptureAspect): ImageCapture {
         CaptureAspect.FULL -> Unit
     }
     return builder.build()
+}
+
+/** Draws a live outline over a document/paper detected by [DocumentEdgeAnalyzer], if any. */
+@Composable
+private fun DocumentScanOverlay(document: DetectedDocument?, modifier: Modifier = Modifier) {
+    val points = document?.previewPoints ?: return
+    if (points.size != 4) return
+
+    Canvas(modifier = modifier) {
+        val path = Path().apply {
+            moveTo(points[0].x, points[0].y)
+            lineTo(points[1].x, points[1].y)
+            lineTo(points[2].x, points[2].y)
+            lineTo(points[3].x, points[3].y)
+            close()
+        }
+        drawPath(path, color = SamsungBlue.copy(alpha = 0.16f), style = Fill)
+        drawPath(path, color = SamsungBlue, style = Stroke(width = 4.dp.toPx()))
+    }
+}
+
+/** Small pill near the top of the screen confirming Scan documents mode and its live state. */
+@Composable
+private fun DocumentScanBadge(
+    modifier: Modifier = Modifier,
+    scanActive: Boolean,
+    documentDetected: Boolean
+) {
+    Row(
+        modifier = modifier
+            .clip(RoundedCornerShape(50))
+            .background(Color.Black.copy(alpha = 0.45f))
+            .padding(horizontal = 14.dp, vertical = 8.dp),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(
+            Icons.Filled.CropFree,
+            contentDescription = null,
+            tint = if (documentDetected) SamsungBlue else Color.White,
+            modifier = Modifier.size(16.dp)
+        )
+        Text(
+            text = when {
+                !scanActive -> "Switch to back camera to scan"
+                documentDetected -> "Document detected"
+                else -> "Scanning for documents"
+            },
+            color = Color.White,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.Medium
+        )
+    }
 }
 
 @Composable
@@ -747,6 +905,57 @@ private fun cropToSquare(context: Context, uri: Uri) {
         }
     } catch (exc: Exception) {
         Log.e("CameraApp", "Failed to crop photo to 1:1", exc)
+    }
+}
+
+/**
+ * Straightens and crops the saved image at [uri] to the document quadrilateral described by
+ * [normalizedCorners] (0..1 fractions, ordered [topLeft, topRight, bottomRight, bottomLeft]),
+ * using a perspective warp -- the same "photo scanner" effect apps like this are modeled on,
+ * done here with plain [android.graphics.Matrix] instead of a native computer-vision dependency
+ * that can't be verified in this build environment.
+ */
+private fun applyDocumentScanCrop(context: Context, uri: Uri, normalizedCorners: List<PointF>) {
+    if (normalizedCorners.size != 4) return
+    try {
+        val original = context.contentResolver.openInputStream(uri)?.use { stream ->
+            BitmapFactory.decodeStream(stream)
+        } ?: return
+
+        val w = original.width.toFloat()
+        val h = original.height.toFloat()
+        val tl = PointF(normalizedCorners[0].x * w, normalizedCorners[0].y * h)
+        val tr = PointF(normalizedCorners[1].x * w, normalizedCorners[1].y * h)
+        val br = PointF(normalizedCorners[2].x * w, normalizedCorners[2].y * h)
+        val bl = PointF(normalizedCorners[3].x * w, normalizedCorners[3].y * h)
+
+        fun dist(a: PointF, b: PointF): Float {
+            val dx = a.x - b.x; val dy = a.y - b.y
+            return kotlin.math.hypot(dx, dy)
+        }
+
+        val outWidth = ((dist(tl, tr) + dist(bl, br)) / 2f).roundToInt().coerceIn(200, original.width)
+        val outHeight = ((dist(tl, bl) + dist(tr, br)) / 2f).roundToInt().coerceIn(200, original.height)
+
+        val source = floatArrayOf(tl.x, tl.y, tr.x, tr.y, br.x, br.y, bl.x, bl.y)
+        val destination = floatArrayOf(
+            0f, 0f,
+            outWidth.toFloat(), 0f,
+            outWidth.toFloat(), outHeight.toFloat(),
+            0f, outHeight.toFloat()
+        )
+
+        val matrix = Matrix()
+        if (!matrix.setPolyToPoly(source, 0, destination, 0, 4)) return // degenerate quad -- keep original
+
+        val straightened = Bitmap.createBitmap(outWidth, outHeight, Bitmap.Config.ARGB_8888)
+        AndroidCanvas(straightened).drawBitmap(original, matrix, Paint(Paint.FILTER_BITMAP_FLAG))
+
+        context.contentResolver.openOutputStream(uri, "wt")?.use { out ->
+            straightened.compress(Bitmap.CompressFormat.JPEG, 95, out)
+        }
+    } catch (exc: Exception) {
+        Log.e("CameraApp", "Failed to apply document scan crop", exc)
     }
 }
 

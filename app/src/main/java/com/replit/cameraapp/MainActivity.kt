@@ -10,6 +10,7 @@ import android.net.Uri
 import android.os.Bundle
 import android.provider.MediaStore
 import android.util.Log
+import android.view.KeyEvent
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -56,11 +57,13 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -94,6 +97,12 @@ private val ZOOM_PRESETS = listOf(1f, 2f, 3f)
 
 class MainActivity : ComponentActivity() {
 
+    /**
+     * Set by [CameraContent] to the current shutter action so the hardware volume
+     * keys can trigger a capture, mirroring Samsung Camera's "volume key to shoot" behavior.
+     */
+    var onVolumeKeyPressed: (() -> Unit)? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -102,6 +111,24 @@ class MainActivity : ComponentActivity() {
                 CameraScreen()
             }
         }
+    }
+
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        if ((keyCode == KeyEvent.KEYCODE_VOLUME_DOWN || keyCode == KeyEvent.KEYCODE_VOLUME_UP) &&
+            event?.repeatCount == 0
+        ) {
+            onVolumeKeyPressed?.invoke()
+            return true
+        }
+        return super.onKeyDown(keyCode, event)
+    }
+
+    override fun onKeyUp(keyCode: Int, event: KeyEvent?): Boolean {
+        if (keyCode == KeyEvent.KEYCODE_VOLUME_DOWN || keyCode == KeyEvent.KEYCODE_VOLUME_UP) {
+            // Consume the key-up too, otherwise the system still raises/lowers volume on release.
+            return true
+        }
+        return super.onKeyUp(keyCode, event)
     }
 }
 
@@ -181,6 +208,23 @@ private fun CameraContent() {
         }
     }
 
+    val performCapture: () -> Unit = {
+        haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+        showFlash = true
+        takePhoto(context, imageCapture, mainExecutor) { uri ->
+            lastPhotoUri = uri
+            capturedPop = true
+        }
+    }
+    val currentPerformCapture by rememberUpdatedState(performCapture)
+
+    // Let the hardware volume keys act as a physical shutter button, like Samsung Camera.
+    DisposableEffect(Unit) {
+        val activity = context as? MainActivity
+        activity?.onVolumeKeyPressed = { currentPerformCapture() }
+        onDispose { activity?.onVolumeKeyPressed = null }
+    }
+
     Box(modifier = Modifier.fillMaxSize()) {
         AndroidView(factory = { previewView }, modifier = Modifier.fillMaxSize())
 
@@ -245,14 +289,7 @@ private fun CameraContent() {
                 thumbnailPop = capturedPop,
                 flipSpins = flipSpins,
                 onThumbnailClick = { openGallery(context, lastPhotoUri) },
-                onCaptureClick = {
-                    haptics.performHapticFeedback(HapticFeedbackType.LongPress)
-                    showFlash = true
-                    takePhoto(context, imageCapture, mainExecutor) { uri ->
-                        lastPhotoUri = uri
-                        capturedPop = true
-                    }
-                },
+                onCaptureClick = performCapture,
                 onFlipClick = {
                     haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                     flipSpins += 1

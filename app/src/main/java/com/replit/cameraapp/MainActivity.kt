@@ -45,6 +45,8 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.rememberTransformableState
+import androidx.compose.foundation.gestures.transformable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
@@ -52,11 +54,13 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -120,7 +124,6 @@ import kotlin.math.roundToInt
 /** Package name of Samsung's stock Gallery app -- opened when the thumbnail is tapped. */
 private const val SAMSUNG_GALLERY_PACKAGE = "com.sec.android.gallery3d"
 
-private val ZOOM_PRESETS = listOf(0.5f, 1f, 2f, 3f, 5f, 10f)
 private val TIMER_OPTIONS = listOf(0, 3, 10)
 
 /** How long the front camera's simulated screen-flash stays lit before the shutter fires. */
@@ -257,11 +260,36 @@ private fun CameraContent(
     var frontFlashActive by remember { mutableStateOf(false) }
     var captureAspect by remember { mutableStateOf(CaptureAspect.FULL) }
     var detectedDocument by remember { mutableStateOf<DetectedDocument?>(null) }
+    var zoomIndicatorPulse by remember { mutableIntStateOf(0) }
+    var zoomIndicatorVisible by remember { mutableStateOf(false) }
 
     // Document scanning only runs on the back camera -- the front camera's mirrored preview
     // would need its own coordinate handling, and scanning a document via selfie camera isn't
     // a real use case, so this keeps the feature simple and correct rather than half-right.
     val scanActive = scanDocumentsEnabled && lensFacing == CameraSelector.LENS_FACING_BACK
+
+    val minZoom = camera?.cameraInfo?.zoomState?.value?.minZoomRatio ?: 1f
+    val maxZoom = camera?.cameraInfo?.zoomState?.value?.maxZoomRatio ?: 1f
+
+    // Two-finger pinch drives zoom continuously (no fixed steps) -- the zoom indicator below
+    // pops up while pinching and lingers for ~2.5s after the last change before fading out,
+    // instead of a permanently docked zoom row.
+    val zoomTransformableState = rememberTransformableState { _, zoomChange, _, _ ->
+        if (zoomChange != 1f) {
+            val newZoom = (zoomRatio * zoomChange).coerceIn(minZoom, maxZoom)
+            zoomRatio = newZoom
+            camera?.cameraControl?.setZoomRatio(newZoom)
+            zoomIndicatorPulse += 1
+        }
+    }
+
+    LaunchedEffect(zoomIndicatorPulse) {
+        if (zoomIndicatorPulse > 0) {
+            zoomIndicatorVisible = true
+            delay(2500)
+            zoomIndicatorVisible = false
+        }
+    }
 
     var imageCapture by remember {
         mutableStateOf(buildImageCapture(CaptureAspect.FULL))
@@ -402,7 +430,12 @@ private fun CameraContent(
     }
 
     Box(modifier = Modifier.fillMaxSize()) {
-        AndroidView(factory = { previewView }, modifier = Modifier.fillMaxSize())
+        AndroidView(
+            factory = { previewView },
+            modifier = Modifier
+                .fillMaxSize()
+                .transformable(state = zoomTransformableState)
+        )
 
         DocumentScanOverlay(
             document = if (scanActive) detectedDocument else null,
@@ -425,17 +458,6 @@ private fun CameraContent(
             Box(modifier = Modifier.fillMaxSize().background(Color.White))
         }
 
-        // Top-left: settings gear, opens the full settings page.
-        PressableIconButton(
-            modifier = Modifier.align(Alignment.TopStart).padding(top = 20.dp, start = 20.dp),
-            onClick = {
-                haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                onOpenSettings()
-            }
-        ) {
-            Icon(Icons.Filled.Settings, contentDescription = "Settings", tint = Color.White)
-        }
-
         if (scanDocumentsEnabled) {
             DocumentScanBadge(
                 modifier = Modifier.align(Alignment.TopCenter).padding(top = 20.dp),
@@ -444,11 +466,20 @@ private fun CameraContent(
             )
         }
 
-        // Top-right: timer + flash toggle, side by side.
+        // Top-right: settings, timer, and flash toggle all together in one row, beside the flash icon.
         Row(
             modifier = Modifier.align(Alignment.TopEnd).padding(top = 20.dp, end = 20.dp),
             horizontalArrangement = Arrangement.spacedBy(12.dp)
         ) {
+            PressableIconButton(
+                onClick = {
+                    haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                    onOpenSettings()
+                }
+            ) {
+                Icon(Icons.Filled.Settings, contentDescription = "Settings", tint = Color.White)
+            }
+
             PressableIconButton(
                 onClick = {
                     haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
@@ -501,6 +532,16 @@ private fun CameraContent(
             }
         }
 
+        // Pinch-to-zoom indicator: hidden by default, pops up beside the preview while the
+        // user pinches with two fingers and fades out ~2.5s after the last change.
+        PinchZoomIndicator(
+            visible = zoomIndicatorVisible,
+            zoomRatio = zoomRatio,
+            minZoom = minZoom,
+            maxZoom = maxZoom,
+            modifier = Modifier.align(Alignment.CenterEnd).padding(end = 18.dp)
+        )
+
         Column(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
@@ -511,20 +552,6 @@ private fun CameraContent(
             AspectRatioSelector(
                 current = captureAspect,
                 onSelect = { captureAspect = it }
-            )
-
-            Spacer(modifier = Modifier.height(14.dp))
-
-            val maxZoom = camera?.cameraInfo?.zoomState?.value?.maxZoomRatio ?: 1f
-            val minZoom = camera?.cameraInfo?.zoomState?.value?.minZoomRatio ?: 1f
-            ZoomSelector(
-                current = zoomRatio,
-                minZoom = minZoom,
-                maxZoom = maxZoom,
-                onSelect = { ratio ->
-                    zoomRatio = ratio
-                    camera?.cameraControl?.setZoomRatio(ratio)
-                }
             )
 
             Spacer(modifier = Modifier.height(18.dp))
@@ -638,37 +665,55 @@ private fun AspectRatioSelector(current: CaptureAspect, onSelect: (CaptureAspect
     }
 }
 
+/**
+ * Transient pinch-to-zoom readout: a vertical track that fills up to the current zoom
+ * level, plus a numeric label. Only shown for a couple of seconds around an active pinch
+ * gesture -- there's no permanently docked zoom row anymore, matching how a two-finger pinch
+ * behaves in most stock camera apps.
+ */
 @Composable
-private fun ZoomSelector(current: Float, minZoom: Float, maxZoom: Float, onSelect: (Float) -> Unit) {
-    val available = ZOOM_PRESETS.filter { it in minZoom..maxZoom || it == 1f }
-    if (available.size <= 1) return
-
-    Row(
-        modifier = Modifier
-            .clip(RoundedCornerShape(50))
-            .background(Color.Black.copy(alpha = 0.35f))
-            .padding(horizontal = 6.dp, vertical = 6.dp),
-        horizontalArrangement = Arrangement.spacedBy(4.dp)
+private fun PinchZoomIndicator(
+    visible: Boolean,
+    zoomRatio: Float,
+    minZoom: Float,
+    maxZoom: Float,
+    modifier: Modifier = Modifier
+) {
+    AnimatedVisibility(
+        visible = visible,
+        enter = fadeIn(),
+        exit = fadeOut(),
+        modifier = modifier
     ) {
-        available.forEach { preset ->
-            val selected = kotlin.math.abs(current - preset) < 0.05f
-            val scale by animateFloatAsState(if (selected) 1.08f else 1f, label = "zoomScale")
+        val range = (maxZoom - minZoom).coerceAtLeast(0.01f)
+        val fraction = ((zoomRatio - minZoom) / range).coerceIn(0f, 1f)
 
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Text(
+                text = String.format(Locale.US, "%.1fx", zoomRatio),
+                color = Color.White,
+                fontSize = 13.sp,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier
+                    .clip(RoundedCornerShape(50))
+                    .background(SamsungBlue)
+                    .padding(horizontal = 10.dp, vertical = 4.dp)
+            )
+            Spacer(modifier = Modifier.height(10.dp))
             Box(
                 modifier = Modifier
-                    .scale(scale)
-                    .clip(CircleShape)
-                    .background(if (selected) Color.White else Color.Transparent)
-                    .clickable { onSelect(preset) }
-                    .padding(horizontal = 12.dp, vertical = 8.dp),
-                contentAlignment = Alignment.Center
+                    .width(6.dp)
+                    .height(200.dp)
+                    .clip(RoundedCornerShape(50))
+                    .background(Color.White.copy(alpha = 0.3f)),
+                contentAlignment = Alignment.BottomCenter
             ) {
-                val label = if (preset < 1f) "${preset}x" else "${preset.roundToInt()}x"
-                Text(
-                    text = label,
-                    color = if (selected) Color.Black else Color.White,
-                    fontSize = 13.sp,
-                    fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .fillMaxHeight(fraction.coerceAtLeast(0.03f))
+                        .clip(RoundedCornerShape(50))
+                        .background(SamsungBlue)
                 )
             }
         }

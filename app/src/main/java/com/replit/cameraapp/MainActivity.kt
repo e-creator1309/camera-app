@@ -629,7 +629,7 @@ private fun AspectRatioSelector(current: CaptureAspect, onSelect: (CaptureAspect
         verticalAlignment = Alignment.CenterVertically
     ) {
         Icon(
-            AspectRatioIcon,
+            Icons.Filled.AspectRatioIcon,
             contentDescription = "Photo size",
             tint = Color.White,
             modifier = Modifier.size(16.dp)

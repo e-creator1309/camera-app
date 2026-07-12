@@ -1,45 +1,40 @@
 [versions]
 agp = "8.13.2"
-androidx_activity_compose = "1.13.0"
-androidx_test = "1.7.0"
-androidx_test_ext = "1.3.0"
-appcompat = "1.7.1"
-compile_sdk_version = "36"
-compose-bom = "2025.12.01"
-compose_compilerextension = "1.5.5"
-constraint_layout = "2.2.1"
-core_ktx = "1.19.0"
-detekt = "1.23.8"
-espresso_core = "3.7.0"
-junit = "4.13.2"
 kotlin = "2.4.0"
-min_sdk_version = "23"
-nexus_publish = "2.0.0"
-target_sdk_version = "36"
+compile-sdk-version = "35"
+target-sdk-version = "35"
+min-sdk-version = "31"
+core-ktx = "1.19.0"
+lifecycle-runtime-ktx = "2.9.4"
+activity-compose = "1.13.0"
+compose-bom = "2025.12.01"
+camera = "1.5.1"
+coil = "2.7.0"
+junit = "4.13.2"
+androidx-test-ext-junit = "1.3.0"
+espresso-core = "3.7.0"
 
 [libraries]
-junit = { module = "junit:junit", version.ref = "junit" }
-androidx_activity_compose = { module = "androidx.activity:activity-compose", version.ref = "androidx_activity_compose" }
-androidx_appcompat = { module = "androidx.appcompat:appcompat", version.ref = "appcompat" }
-androidx_constraint_layout = { module = "androidx.constraintlayout:constraintlayout", version.ref = "constraint_layout" }
-androidx_core_ktx = { module = "androidx.core:core-ktx", version.ref = "core_ktx" }
-androidx_test_rules = { module = "androidx.test:rules", version.ref = "androidx_test" }
-androidx_test_runner = { module = "androidx.test:runner", version.ref = "androidx_test" }
-androidx_test_ext_junit = { module = "androidx.test.ext:junit", version.ref = "androidx_test_ext" }
-androidx_test_ext_junit_ktx = { module = "androidx.test.ext:junit-ktx", version.ref = "androidx_test_ext" }
+androidx-core-ktx = { module = "androidx.core:core-ktx", version.ref = "core-ktx" }
+androidx-lifecycle-runtime-ktx = { module = "androidx.lifecycle:lifecycle-runtime-ktx", version.ref = "lifecycle-runtime-ktx" }
+androidx-activity-compose = { module = "androidx.activity:activity-compose", version.ref = "activity-compose" }
 compose-bom = { module = "androidx.compose:compose-bom", version.ref = "compose-bom" }
-compose_material = { module = "androidx.compose.material:material" }
-compose_foundation = { module = "androidx.compose.foundation:foundation" }
-compose_ui = { module = "androidx.compose.ui:ui" }
-compose_ui_tooling = { module = "androidx.compose.ui:ui-tooling" }
-compose_ui_test_junit4 = { module = "androidx.compose.ui:ui-test-junit4" }
-compose_ui_test_manifest = { module = "androidx.compose.ui:ui-test-manifest" }
-detekt_formatting = { module = "io.gitlab.arturbosch.detekt:detekt-formatting", version.ref = "detekt" }
-espresso_core = { module = "androidx.test.espresso:espresso-core", version.ref = "espresso_core" }
-agp = { module = "com.android.tools.build:gradle", version.ref = "agp" }
-kgp = { module = "org.jetbrains.kotlin:kotlin-gradle-plugin", version.ref = "kotlin" }
+compose-ui = { module = "androidx.compose.ui:ui" }
+compose-ui-graphics = { module = "androidx.compose.ui:ui-graphics" }
+compose-ui-tooling = { module = "androidx.compose.ui:ui-tooling" }
+compose-ui-tooling-preview = { module = "androidx.compose.ui:ui-tooling-preview" }
+compose-material3 = { module = "androidx.compose.material3:material3" }
+compose-material-icons-extended = { module = "androidx.compose.material:material-icons-extended" }
+camera-core = { module = "androidx.camera:camera-core", version.ref = "camera" }
+camera-camera2 = { module = "androidx.camera:camera-camera2", version.ref = "camera" }
+camera-lifecycle = { module = "androidx.camera:camera-lifecycle", version.ref = "camera" }
+camera-view = { module = "androidx.camera:camera-view", version.ref = "camera" }
+coil-compose = { module = "io.coil-kt:coil-compose", version.ref = "coil" }
+junit = { module = "junit:junit", version.ref = "junit" }
+androidx-test-ext-junit = { module = "androidx.test.ext:junit", version.ref = "androidx-test-ext-junit" }
+espresso-core = { module = "androidx.test.espresso:espresso-core", version.ref = "espresso-core" }
 
 [plugins]
-detekt = { id = "io.gitlab.arturbosch.detekt", version.ref = "detekt" }
-compose-compiler = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
-nexus-publish = { id = "io.github.gradle-nexus.publish-plugin", version.ref = "nexus_publish" }
+android-application = { id = "com.android.application", version.ref = "agp" }
+kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
+kotlin-compose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }

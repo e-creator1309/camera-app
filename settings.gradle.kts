@@ -13,13 +13,6 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = ("kotlin-android-template")
+rootProject.name = "camera-app"
 
-enableFeaturePreview("TYPESAFE_PROJECT_ACCESSORS")
-
-include(
-    "app",
-    "library-android",
-    "library-compose",
-    "library-kotlin"
-)
+include(":app")

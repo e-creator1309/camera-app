@@ -28,18 +28,33 @@ data class DetectedDocument(
 )
 
 /**
- * Lightweight, dependency-free document/paper edge detector for [ImageAnalysis].
+ * Lightweight, dependency-free document/paper detector for [ImageAnalysis].
  *
- * There's no OpenCV or ML model here -- just a coarse luma edge map plus a corner-extremity
- * heuristic, hardened against the false positives a single-pixel version is prone to:
+ * There's no OpenCV or ML model here. Earlier versions of this analyzer picked out raw
+ * high-contrast *edge pixels* and took the most extreme one in each corner direction --
+ * that fell apart on anything with texture, because dense handwriting/text or a cluttered,
+ * grainy background produces edge pixels everywhere, not just at the paper's boundary, so
+ * the "corners" ended up scattered across whatever was busiest in frame rather than the
+ * actual sheet of paper.
  *
- *  - a 3x3 box blur runs before edge detection, so sensor noise doesn't get picked up as an
- *    "edge" in the first place;
- *  - each corner is the *average* of several of the strongest nearby edge points rather than
- *    a single most-extreme pixel, so one stray speck can't drag a corner out to the wrong spot;
- *  - candidate quads are rejected unless they're convex and reasonably rectangular (no side
- *    wildly longer than another), which throws out the random slivers a naive corner pick can
- *    otherwise report as a "document"; and
+ * This version instead segments the frame into two brightness classes with an automatic
+ * (Otsu) threshold, finds the single largest *connected* region of one class, and only then
+ * takes that region's corners. A real sheet of paper is a solid, contiguous blob of roughly
+ * one brightness against a differently-lit background -- it stays one blob no matter how much
+ * handwriting or texture is on it, whereas a busy/cluttered background breaks into many small,
+ * disconnected regions that lose out to the paper on size. Concretely:
+ *
+ *  - a 3x3 box blur runs before thresholding, so sensor noise doesn't fragment the blob;
+ *  - Otsu's method picks the brightness split automatically per-frame instead of a fixed
+ *    threshold, so it adapts to the actual lighting instead of assuming a fixed exposure;
+ *  - both the brighter-than-threshold and darker-than-threshold classes are tried (light
+ *    paper on a dark desk, or a dark cover on a light desk both work);
+ *  - a flood fill finds the largest connected component of that class, and corners are the
+ *    *average* of several of that component's most extreme points in each direction, so one
+ *    jagged pixel at the mask boundary can't drag a corner out to the wrong spot;
+ *  - the region has to actually fill most of its own bounding quad ("fill ratio"), which
+ *    rejects sparse, scattered regions that happen to have the right bounding box but aren't
+ *    really a solid rectangle; and
  *  - accepted corners are eased toward the previous frame's corners (light temporal smoothing)
  *    so the outline doesn't jitter or snap between frames.
  *
@@ -52,8 +67,15 @@ class DocumentEdgeAnalyzer(
     private val onResult: (DetectedDocument?) -> Unit
 ) : ImageAnalysis.Analyzer {
 
-    private val gridWidth = 120
-    private val gridHeight = 160
+    private companion object {
+        // 4-connectivity neighbor offsets (right, left, down, up), used by [findLargestComponent].
+        val NEIGHBOR_DX = intArrayOf(1, -1, 0, 0)
+        val NEIGHBOR_DY = intArrayOf(0, 0, 1, -1)
+    }
+
+    private val gridWidth = 160
+    private val gridHeight = 214
+    private val margin = 6 // ignore a thin border, where lens vignetting/noise causes false regions
     private var lastAnalyzedAt = 0L
 
     // Corners (in analysis-buffer pixel space) from the last accepted detection, used to ease
@@ -100,42 +122,73 @@ class DocumentEdgeAnalyzer(
             }
         }
 
-        // Light denoise before edge detection -- without this, isolated noisy pixels near the
-        // frame edge were the main cause of the outline snapping to the wrong place.
+        // Light denoise before thresholding -- without this, isolated noisy pixels fragment
+        // the paper's blob into smaller pieces that then lose out to the background on size.
         val blurred = boxBlur3x3(gray)
 
-        // Simple gradient-magnitude edge map (difference vs. right/below neighbor).
-        val edgeThreshold = 24
-        val margin = 4 // ignore a thin border, where lens vignetting/noise causes false edges
-        val edgeXs = ArrayList<Int>()
-        val edgeYs = ArrayList<Int>()
-        for (gy in margin until gridHeight - margin - 1) {
-            for (gx in margin until gridWidth - margin - 1) {
-                val here = blurred[gy * gridWidth + gx].toInt() and 0xFF
-                val right = blurred[gy * gridWidth + gx + 1].toInt() and 0xFF
-                val below = blurred[(gy + 1) * gridWidth + gx].toInt() and 0xFF
-                val gradient = abs(here - right) + abs(here - below)
-                if (gradient > edgeThreshold) {
-                    edgeXs.add(gx)
-                    edgeYs.add(gy)
-                }
+        // Automatic brightness split (Otsu's method) over the interior of the frame, so the
+        // threshold adapts to actual lighting instead of assuming a fixed exposure.
+        val histogram = IntArray(256)
+        var sampleCount = 0
+        for (gy in margin until gridHeight - margin) {
+            for (gx in margin until gridWidth - margin) {
+                histogram[blurred[gy * gridWidth + gx].toInt() and 0xFF]++
+                sampleCount++
             }
         }
+        if (sampleCount == 0) return fail()
+        val threshold = otsuThreshold(histogram, sampleCount)
 
-        // Too few edges -- nothing resembling a document in frame.
-        val minEdgePixels = (gridWidth * gridHeight) / 60
-        if (edgeXs.size < minEdgePixels) return fail()
+        val brightMask = BooleanArray(gridWidth * gridHeight) { i -> (blurred[i].toInt() and 0xFF) > threshold }
+        val darkMask = BooleanArray(gridWidth * gridHeight) { i -> !brightMask[i] }
 
-        // For each frame corner, average the strongest handful of edge points that push
-        // furthest toward it, rather than trusting a single most-extreme pixel.
-        val topK = 8
-        val topLeftGrid = averageExtremePoint(edgeXs, edgeYs, topK) { x, y -> -(x + y) }
-        val topRightGrid = averageExtremePoint(edgeXs, edgeYs, topK) { x, y -> x - y }
-        val bottomRightGrid = averageExtremePoint(edgeXs, edgeYs, topK) { x, y -> x + y }
-        val bottomLeftGrid = averageExtremePoint(edgeXs, edgeYs, topK) { x, y -> y - x }
+        // Try the brighter class first -- the common case of light paper on a darker
+        // desk/background -- then fall back to the darker class (e.g. a dark cover on a
+        // light desk). Whichever one actually forms a solid, rectangular blob wins.
+        val document = buildDocument(brightMask, cropRect, cropW, cropH, image.imageInfo.rotationDegrees)
+            ?: buildDocument(darkMask, cropRect, cropW, cropH, image.imageInfo.rotationDegrees)
+
+        return document ?: fail()
+    }
+
+    /**
+     * Attempts to find a document-shaped quadrilateral from the largest connected component
+     * of [mask], returning `null` (without touching [smoothedCorners]) if this particular
+     * mask doesn't produce a convincing one -- the caller tries the opposite mask next.
+     */
+    private fun buildDocument(
+        mask: BooleanArray,
+        cropRect: Rect,
+        cropW: Int,
+        cropH: Int,
+        rotationDegrees: Int
+    ): DetectedDocument? {
+        val component = findLargestComponent(mask) ?: return null
+        val (compXs, compYs) = component
+
+        // Too small to be a document filling any meaningful part of the frame.
+        val minComponentCells = (gridWidth * gridHeight) / 50
+        if (compXs.size < minComponentCells) return null
+
+        // For each frame corner, average the strongest handful of this component's points
+        // that push furthest toward it, rather than trusting a single most-extreme pixel.
+        val topK = 6
+        val xsList = compXs.toList()
+        val ysList = compYs.toList()
+        val topLeftGrid = averageExtremePoint(xsList, ysList, topK) { x, y -> -(x + y) }
+        val topRightGrid = averageExtremePoint(xsList, ysList, topK) { x, y -> x - y }
+        val bottomRightGrid = averageExtremePoint(xsList, ysList, topK) { x, y -> x + y }
+        val bottomLeftGrid = averageExtremePoint(xsList, ysList, topK) { x, y -> y - x }
         if (topLeftGrid == null || topRightGrid == null || bottomRightGrid == null || bottomLeftGrid == null) {
-            return fail()
+            return null
         }
+
+        // The component has to actually fill most of its own bounding quad -- this is what
+        // separates a solid sheet of paper from a scattered, oddly-shaped patch of background
+        // that happens to share a brightness class but isn't really a rectangle.
+        val quadAreaGrid = quadrilateralArea(topLeftGrid, topRightGrid, bottomRightGrid, bottomLeftGrid)
+        val fillRatio = compXs.size.toFloat() / quadAreaGrid.coerceAtLeast(1f)
+        if (fillRatio < 0.45f) return null
 
         fun toBufferPoint(grid: PointF): PointF = PointF(
             cropRect.left + grid.x * cropW / gridWidth.toFloat(),
@@ -149,12 +202,11 @@ class DocumentEdgeAnalyzer(
 
         // Sanity checks: the four corners must form a reasonably sized, convex,
         // roughly-rectangular quad, otherwise noisy scenes with no real document would
-        // constantly "detect" garbage (this is what used to produce a stray rectangle
-        // nowhere near the actual paper/book).
+        // constantly "detect" garbage.
         val quadArea = quadrilateralArea(topLeft, topRight, bottomRight, bottomLeft)
         val frameArea = cropW.toFloat() * cropH.toFloat()
         val areaRatio = quadArea / frameArea
-        if (areaRatio < 0.12f || areaRatio > 0.97f) return fail()
+        if (areaRatio < 0.12f || areaRatio > 0.97f) return null
 
         val topSide = distance(topLeft, topRight)
         val rightSide = distance(topRight, bottomRight)
@@ -162,11 +214,11 @@ class DocumentEdgeAnalyzer(
         val leftSide = distance(bottomLeft, topLeft)
         val minSide = min(min(topSide, rightSide), min(bottomSide, leftSide))
         val maxSide = max(max(topSide, rightSide), max(bottomSide, leftSide))
-        if (minSide < cropW * 0.08f) return fail()
+        if (minSide < cropW * 0.08f) return null
         // A real sheet of paper or book cover doesn't have one side wildly longer than
         // another -- reject thin slivers this heuristic would otherwise happily box up.
-        if (maxSide / minSide > 3.2f) return fail()
-        if (!isConvexQuad(topLeft, topRight, bottomRight, bottomLeft)) return fail()
+        if (maxSide / minSide > 3.2f) return null
+        if (!isConvexQuad(topLeft, topRight, bottomRight, bottomLeft)) return null
 
         val rawCorners = listOf(topLeft, topRight, bottomRight, bottomLeft)
         val previous = smoothedCorners
@@ -182,8 +234,8 @@ class DocumentEdgeAnalyzer(
         }
         smoothedCorners = corners
 
-        val previewPoints = mapToPreviewSpace(corners, cropRect, image.imageInfo.rotationDegrees) ?: return fail()
-        val normalizedCorners = normalizeUpright(corners, cropRect, image.imageInfo.rotationDegrees)
+        val previewPoints = mapToPreviewSpace(corners, cropRect, rotationDegrees) ?: return null
+        val normalizedCorners = normalizeUpright(corners, cropRect, rotationDegrees)
 
         return DetectedDocument(previewPoints, normalizedCorners)
     }
@@ -194,7 +246,7 @@ class DocumentEdgeAnalyzer(
         return null
     }
 
-    /** 3x3 box blur over the coarse luma grid, used to suppress single-pixel noise before edge detection. */
+    /** 3x3 box blur over the coarse luma grid, used to suppress single-pixel noise before thresholding. */
     private fun boxBlur3x3(src: ByteArray): ByteArray {
         val out = ByteArray(src.size)
         for (gy in 0 until gridHeight) {
@@ -218,9 +270,100 @@ class DocumentEdgeAnalyzer(
     }
 
     /**
-     * Averages the coordinates of the [topK] edge points that score highest under [score],
-     * in grid space. Used instead of a single argmax pick so one noisy outlier pixel can't
-     * single-handedly relocate a corner.
+     * Otsu's method: picks the brightness value that best splits [histogram] (a 256-bin luma
+     * histogram covering [totalSamples] pixels) into two classes by maximizing the variance
+     * *between* the two classes' means -- the standard automatic-thresholding technique for
+     * separating a bright object from a dark background (or vice versa) regardless of exposure.
+     */
+    private fun otsuThreshold(histogram: IntArray, totalSamples: Int): Int {
+        var sumAll = 0L
+        for (level in histogram.indices) sumAll += level.toLong() * histogram[level]
+
+        var weightBelow = 0L
+        var sumBelow = 0L
+        var bestVariance = -1.0
+        var bestThreshold = 127
+        for (level in 0..255) {
+            weightBelow += histogram[level]
+            if (weightBelow == 0L) continue
+            val weightAbove = totalSamples - weightBelow
+            if (weightAbove == 0L) break
+            sumBelow += level.toLong() * histogram[level]
+
+            val meanBelow = sumBelow.toDouble() / weightBelow
+            val meanAbove = (sumAll - sumBelow).toDouble() / weightAbove
+            val meanDelta = meanBelow - meanAbove
+            val betweenClassVariance = weightBelow.toDouble() * weightAbove.toDouble() * meanDelta * meanDelta
+            if (betweenClassVariance > bestVariance) {
+                bestVariance = betweenClassVariance
+                bestThreshold = level
+            }
+        }
+        return bestThreshold
+    }
+
+    /**
+     * Flood-fills [mask] (grid-space, `true` = this class) within the margin bounds and
+     * returns the grid coordinates of its largest 4-connected component, or `null` if [mask]
+     * has no set pixels there at all.
+     */
+    private fun findLargestComponent(mask: BooleanArray): Pair<IntArray, IntArray>? {
+        val visited = BooleanArray(gridWidth * gridHeight)
+        val stackX = IntArray(gridWidth * gridHeight)
+        val stackY = IntArray(gridWidth * gridHeight)
+        var bestXs: IntArray? = null
+        var bestYs: IntArray? = null
+        var bestSize = 0
+
+        for (startY in margin until gridHeight - margin) {
+            for (startX in margin until gridWidth - margin) {
+                val startIndex = startY * gridWidth + startX
+                if (visited[startIndex] || !mask[startIndex]) continue
+
+                var stackSize = 1
+                stackX[0] = startX
+                stackY[0] = startY
+                visited[startIndex] = true
+                val compXs = ArrayList<Int>()
+                val compYs = ArrayList<Int>()
+
+                while (stackSize > 0) {
+                    stackSize--
+                    val x = stackX[stackSize]
+                    val y = stackY[stackSize]
+                    compXs.add(x)
+                    compYs.add(y)
+
+                    for (dir in 0 until 4) {
+                        val nx = x + NEIGHBOR_DX[dir]
+                        val ny = y + NEIGHBOR_DY[dir]
+                        if (nx < margin || nx >= gridWidth - margin || ny < margin || ny >= gridHeight - margin) continue
+                        val nIndex = ny * gridWidth + nx
+                        if (visited[nIndex] || !mask[nIndex]) continue
+                        visited[nIndex] = true
+                        stackX[stackSize] = nx
+                        stackY[stackSize] = ny
+                        stackSize++
+                    }
+                }
+
+                if (compXs.size > bestSize) {
+                    bestSize = compXs.size
+                    bestXs = compXs.toIntArray()
+                    bestYs = compYs.toIntArray()
+                }
+            }
+        }
+
+        val xs = bestXs ?: return null
+        val ys = bestYs ?: return null
+        return xs to ys
+    }
+
+    /**
+     * Averages the coordinates of the [topK] points that score highest under [score], in grid
+     * space. Used instead of a single argmax pick so one jagged outlier pixel at the mask
+     * boundary can't single-handedly relocate a corner.
      */
     private fun averageExtremePoint(
         xs: List<Int>,

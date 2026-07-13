@@ -15,6 +15,7 @@ import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.PointF
 import android.graphics.RenderEffect as AndroidRenderEffect
+import android.media.ExifInterface
 import android.net.Uri
 import android.os.Bundle
 import android.provider.MediaStore
@@ -1418,9 +1419,9 @@ private suspend fun capturePhoto(
 /** Center-crops the saved image at [uri] down to a square, in place. */
 private fun cropToSquare(context: Context, uri: Uri) {
     try {
-        val original = context.contentResolver.openInputStream(uri)?.use { stream ->
-            BitmapFactory.decodeStream(stream)
-        } ?: return
+        // Decode with EXIF rotation applied so we crop the visually-upright image,
+        // not the raw sensor-orientation bytes (which may be landscape for a portrait shot).
+        val original = decodeBitmapUpright(context, uri) ?: return
 
         val side = minOf(original.width, original.height)
         val x = (original.width - side) / 2
@@ -1445,9 +1446,11 @@ private fun cropToSquare(context: Context, uri: Uri) {
 private fun applyDocumentScanCrop(context: Context, uri: Uri, normalizedCorners: List<PointF>) {
     if (normalizedCorners.size != 4) return
     try {
-        val original = context.contentResolver.openInputStream(uri)?.use { stream ->
-            BitmapFactory.decodeStream(stream)
-        } ?: return
+        // IMPORTANT: normalizedCorners are in *upright/display* space (rotation-corrected 0..1),
+        // computed by DocumentEdgeAnalyzer.normalizeUpright().  BitmapFactory.decodeStream()
+        // on its own returns pixels in *sensor-native* orientation (ignoring EXIF), so we must
+        // rotate the bitmap to match display orientation before mapping the corners onto it.
+        val original = decodeBitmapUpright(context, uri) ?: return
 
         val w = original.width.toFloat()
         val h = original.height.toFloat()
@@ -1493,9 +1496,9 @@ private fun applyDocumentScanCrop(context: Context, uri: Uri, normalizedCorners:
  */
 private fun applyWatermark(context: Context, uri: Uri) {
     try {
-        val original = context.contentResolver.openInputStream(uri)?.use { stream ->
-            BitmapFactory.decodeStream(stream)
-        } ?: return
+        // Decode upright so the watermark lands in the correct visual corner,
+        // not the sensor-native corner (which may be a different physical edge).
+        val original = decodeBitmapUpright(context, uri) ?: return
 
         val watermarked = if (original.isMutable && original.config == Bitmap.Config.ARGB_8888) {
             original
@@ -1543,9 +1546,9 @@ private suspend fun applyPortraitBackgroundBlur(context: Context, uri: Uri) {
             .build()
     )
     try {
-        val original = context.contentResolver.openInputStream(uri)?.use { stream ->
-            BitmapFactory.decodeStream(stream)
-        } ?: return
+        // Decode upright so ML Kit's segmentation mask aligns with the correct image orientation.
+        // InputImage.fromBitmap(bitmap, rotationDegrees=0) assumes the bitmap is already upright.
+        val original = decodeBitmapUpright(context, uri) ?: return
 
         val sharp = if (original.config == Bitmap.Config.ARGB_8888) {
             original
@@ -1622,6 +1625,69 @@ private fun blendPixel(sharp: Int, blurred: Int, personConfidence: Float): Int {
     val g = (sg * personConfidence + bg * (1f - personConfidence)).roundToInt().coerceIn(0, 255)
     val b = (sb * personConfidence + bb * (1f - personConfidence)).roundToInt().coerceIn(0, 255)
     return (a shl 24) or (r shl 16) or (g shl 8) or b
+}
+
+/**
+ * Decodes the JPEG at [uri] and returns a bitmap that is already rotated to the correct
+ * display/upright orientation by reading and applying the EXIF [ExifInterface.TAG_ORIENTATION]
+ * tag before returning.
+ *
+ * Why this matters: [BitmapFactory.decodeStream] returns raw sensor-native pixels and ignores
+ * EXIF orientation entirely.  When the phone is held portrait and the back camera sensor is
+ * landscape (the common case), the returned bitmap is landscape even though the saved file
+ * looks portrait in every gallery app (they all honour the EXIF tag).
+ *
+ * Any post-processing that maps coordinates from the live analysis frame onto the saved
+ * bitmap (document crop corners, square crop, watermark position, segmentation mask) must
+ * work in the same orientation space.  Using this helper everywhere ensures that.
+ *
+ * Two [ContentResolver.openInputStream] calls are made: the first reads only the EXIF header
+ * (a few KB at most), the second decodes the full pixel data.  Both are closed immediately
+ * after use.  The rotation matrix is applied via [Bitmap.createBitmap] so the returned
+ * bitmap is a new, correctly-oriented copy; the original raw bitmap is recycled.
+ */
+private fun decodeBitmapUpright(context: Context, uri: Uri): Bitmap? {
+    // Pass 1: read EXIF orientation (reads only the header, not all pixel data).
+    val exifOrientation = try {
+        context.contentResolver.openInputStream(uri)?.use { stream ->
+            ExifInterface(stream).getAttributeInt(
+                ExifInterface.TAG_ORIENTATION,
+                ExifInterface.ORIENTATION_NORMAL
+            )
+        } ?: ExifInterface.ORIENTATION_NORMAL
+    } catch (_: Exception) {
+        ExifInterface.ORIENTATION_NORMAL
+    }
+
+    // Pass 2: decode full pixel data in sensor-native orientation.
+    val raw = context.contentResolver.openInputStream(uri)?.use { stream ->
+        BitmapFactory.decodeStream(stream)
+    } ?: return null
+
+    // Build the matrix that transforms sensor orientation → upright display orientation.
+    val matrix = Matrix()
+    when (exifOrientation) {
+        ExifInterface.ORIENTATION_ROTATE_90    -> matrix.postRotate(90f)
+        ExifInterface.ORIENTATION_ROTATE_180   -> matrix.postRotate(180f)
+        ExifInterface.ORIENTATION_ROTATE_270   -> matrix.postRotate(270f)
+        ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> matrix.postScale(-1f, 1f)
+        ExifInterface.ORIENTATION_FLIP_VERTICAL   -> matrix.postScale(1f, -1f)
+        ExifInterface.ORIENTATION_TRANSPOSE -> {
+            // 90° CCW + horizontal flip
+            matrix.postScale(-1f, 1f)
+            matrix.postRotate(-90f)
+        }
+        ExifInterface.ORIENTATION_TRANSVERSE -> {
+            // 90° CW + horizontal flip
+            matrix.postScale(-1f, 1f)
+            matrix.postRotate(90f)
+        }
+        else -> return raw // ORIENTATION_NORMAL (1) or unknown — already upright, no work needed
+    }
+
+    val upright = Bitmap.createBitmap(raw, 0, 0, raw.width, raw.height, matrix, true)
+    raw.recycle()
+    return upright
 }
 
 /**

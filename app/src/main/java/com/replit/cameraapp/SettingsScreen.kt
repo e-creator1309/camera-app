@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.BrandingWatermark
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Switch
@@ -45,6 +46,8 @@ private val SecondaryText = Color(0xFF9A9A9E)
 fun SettingsScreen(
     scanDocumentsEnabled: Boolean,
     onScanDocumentsChanged: (Boolean) -> Unit,
+    watermarkEnabled: Boolean,
+    onWatermarkChanged: (Boolean) -> Unit,
     onBack: () -> Unit
 ) {
     Column(
@@ -86,6 +89,16 @@ fun SettingsScreen(
             subtitle = "Recognize documents and papers, and straighten them automatically when captured",
             checked = scanDocumentsEnabled,
             onCheckedChange = onScanDocumentsChanged
+        )
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        SettingsToggleRow(
+            icon = Icons.Filled.BrandingWatermark,
+            title = "Watermark",
+            subtitle = "Stamp the app name and date onto every photo you capture",
+            checked = watermarkEnabled,
+            onCheckedChange = onWatermarkChanged
         )
     }
 }

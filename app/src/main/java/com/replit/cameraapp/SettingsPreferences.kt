@@ -4,6 +4,7 @@ import android.content.Context
 
 private const val PREFS_NAME = "camera_app_settings"
 private const val KEY_SCAN_DOCUMENTS_ENABLED = "scan_documents_enabled"
+private const val KEY_WATERMARK_ENABLED = "watermark_enabled"
 
 /** Thin, persisted wrapper around the app's settings so they survive app restarts. */
 object SettingsPreferences {
@@ -13,6 +14,13 @@ object SettingsPreferences {
 
     fun setScanDocumentsEnabled(context: Context, enabled: Boolean) {
         prefs(context).edit().putBoolean(KEY_SCAN_DOCUMENTS_ENABLED, enabled).apply()
+    }
+
+    fun isWatermarkEnabled(context: Context): Boolean =
+        prefs(context).getBoolean(KEY_WATERMARK_ENABLED, false)
+
+    fun setWatermarkEnabled(context: Context, enabled: Boolean) {
+        prefs(context).edit().putBoolean(KEY_WATERMARK_ENABLED, enabled).apply()
     }
 
     private fun prefs(context: Context) =

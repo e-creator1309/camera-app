@@ -45,6 +45,11 @@ import androidx.camera.video.Recording
 import androidx.camera.video.VideoCapture
 import androidx.camera.video.VideoRecordEvent
 import androidx.camera.view.PreviewView
+import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.segmentation.Segmentation
+import com.google.mlkit.vision.segmentation.SegmentationMask
+import com.google.mlkit.vision.segmentation.Segmenter
+import com.google.mlkit.vision.segmentation.selfie.SelfieSegmenterOptions
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.RepeatMode
@@ -142,6 +147,7 @@ import java.util.Locale
 import java.util.concurrent.Executor
 import java.util.concurrent.Executors
 import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 import kotlin.math.roundToInt
 
 /** Package name of Samsung's stock Gallery app -- opened when the thumbnail is tapped. */
@@ -178,9 +184,9 @@ private enum class PhotoFilter(val label: String) {
 }
 
 /**
- * The capture category shown in the row above the shutter. Only [PHOTO] and [VIDEO] are wired
- * up to real camera behavior; [PORTRAIT] and [MORE] are placeholders reserved for later work --
- * selecting them is purely cosmetic and falls back to the same behavior as [PHOTO].
+ * The capture category shown in the row above the shutter. [PHOTO], [VIDEO], and [PORTRAIT] are
+ * wired up to real camera behavior; [MORE] is a placeholder reserved for later work -- selecting
+ * it is purely cosmetic and falls back to the same behavior as [PHOTO].
  */
 private enum class CaptureMode(val label: String) {
     PHOTO("PHOTO"),
@@ -259,6 +265,7 @@ private fun CameraScreen() {
 
     var screen by remember { mutableStateOf(Screen.CAMERA) }
     var scanDocumentsEnabled by remember { mutableStateOf(SettingsPreferences.isScanDocumentsEnabled(context)) }
+    var watermarkEnabled by remember { mutableStateOf(SettingsPreferences.isWatermarkEnabled(context)) }
 
     BackHandler(enabled = screen == Screen.SETTINGS) { screen = Screen.CAMERA }
 
@@ -269,6 +276,7 @@ private fun CameraScreen() {
                 // timer, and the last-photo thumbnail aren't reset just from opening the gear menu.
                 CameraContent(
                     scanDocumentsEnabled = scanDocumentsEnabled,
+                    watermarkEnabled = watermarkEnabled,
                     onOpenSettings = { screen = Screen.SETTINGS }
                 )
 
@@ -278,6 +286,11 @@ private fun CameraScreen() {
                         onScanDocumentsChanged = { enabled ->
                             scanDocumentsEnabled = enabled
                             SettingsPreferences.setScanDocumentsEnabled(context, enabled)
+                        },
+                        watermarkEnabled = watermarkEnabled,
+                        onWatermarkChanged = { enabled ->
+                            watermarkEnabled = enabled
+                            SettingsPreferences.setWatermarkEnabled(context, enabled)
                         },
                         onBack = { screen = Screen.CAMERA }
                     )
@@ -294,6 +307,7 @@ private fun CameraScreen() {
 @Composable
 private fun CameraContent(
     scanDocumentsEnabled: Boolean,
+    watermarkEnabled: Boolean,
     onOpenSettings: () -> Unit
 ) {
     val context = LocalContext.current
@@ -516,6 +530,14 @@ private fun CameraContent(
                     // to it -- "Full" only, so it doesn't fight with the 4:3/1:1/16:9 crops.
                     if (scanActive && captureAspect == CaptureAspect.FULL && documentCorners != null) {
                         applyDocumentScanCrop(context, uri, documentCorners)
+                    }
+                    // Portrait mode blurs everything the segmenter doesn't recognize as a
+                    // person, giving the same soft-background look as a real depth camera.
+                    if (captureMode == CaptureMode.PORTRAIT) {
+                        applyPortraitBackgroundBlur(context, uri)
+                    }
+                    if (watermarkEnabled) {
+                        applyWatermark(context, uri)
                     }
                     lastPhotoUri = uri
                     capturedPop = true
@@ -1462,6 +1484,144 @@ private fun applyDocumentScanCrop(context: Context, uri: Uri, normalizedCorners:
     } catch (exc: Exception) {
         Log.e("CameraApp", "Failed to apply document scan crop", exc)
     }
+}
+
+/**
+ * Stamps a small "CameraApp" + capture-date watermark into the bottom-right corner of the
+ * saved image at [uri], in place. A soft drop shadow behind the text keeps it legible over
+ * both light and dark backgrounds without needing a solid backing plate.
+ */
+private fun applyWatermark(context: Context, uri: Uri) {
+    try {
+        val original = context.contentResolver.openInputStream(uri)?.use { stream ->
+            BitmapFactory.decodeStream(stream)
+        } ?: return
+
+        val watermarked = if (original.isMutable && original.config == Bitmap.Config.ARGB_8888) {
+            original
+        } else {
+            original.copy(Bitmap.Config.ARGB_8888, true)
+        }
+        val canvas = AndroidCanvas(watermarked)
+
+        val timestamp = SimpleDateFormat("MMM d, yyyy \u00b7 HH:mm", Locale.getDefault())
+            .format(System.currentTimeMillis())
+        val label = "CameraApp  \u2022  $timestamp"
+
+        val textSizePx = watermarked.width / 28f
+        val padding = watermarked.width / 45f
+
+        val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = android.graphics.Color.WHITE
+            textSize = textSizePx
+            textAlign = Paint.Align.RIGHT
+            setShadowLayer(textSizePx / 6f, 0f, 0f, android.graphics.Color.argb(200, 0, 0, 0))
+        }
+
+        canvas.drawText(label, watermarked.width - padding, watermarked.height - padding, textPaint)
+
+        context.contentResolver.openOutputStream(uri, "wt")?.use { out ->
+            watermarked.compress(Bitmap.CompressFormat.JPEG, 95, out)
+        }
+    } catch (exc: Exception) {
+        Log.e("CameraApp", "Failed to apply watermark", exc)
+    }
+}
+
+/**
+ * Blurs everything behind the subject in the saved photo at [uri], in place, giving Portrait
+ * mode the same soft-background look as a real depth camera even though this device only has
+ * one lens. Uses ML Kit's on-device Selfie Segmenter to tell foreground from background, then
+ * blends a blurred copy of the photo back in wherever the person confidence is low -- soft,
+ * confidence-weighted blending (rather than a hard cutout) is what keeps the edges around hair
+ * and shoulders from looking cut out with scissors.
+ */
+private suspend fun applyPortraitBackgroundBlur(context: Context, uri: Uri) {
+    val segmenter = Segmentation.getClient(
+        SelfieSegmenterOptions.Builder()
+            .setDetectorMode(SelfieSegmenterOptions.SINGLE_IMAGE_MODE)
+            .build()
+    )
+    try {
+        val original = context.contentResolver.openInputStream(uri)?.use { stream ->
+            BitmapFactory.decodeStream(stream)
+        } ?: return
+
+        val sharp = if (original.config == Bitmap.Config.ARGB_8888) {
+            original
+        } else {
+            original.copy(Bitmap.Config.ARGB_8888, false)
+        }
+
+        val mask = segmentPerson(segmenter, InputImage.fromBitmap(sharp, 0))
+        val width = sharp.width
+        val height = sharp.height
+        if (mask.width != width || mask.height != height) {
+            // The segmenter is expected to rescale its mask to the input image size; bail
+            // out rather than risk compositing misaligned pixels if that assumption ever changes.
+            return
+        }
+
+        val blurred = downscaleBlur(sharp)
+
+        val sharpPixels = IntArray(width * height)
+        val blurredPixels = IntArray(width * height)
+        sharp.getPixels(sharpPixels, 0, width, 0, 0, width, height)
+        blurred.getPixels(blurredPixels, 0, width, 0, 0, width, height)
+
+        val confidence = mask.buffer
+        confidence.rewind()
+        val outPixels = IntArray(width * height)
+        for (i in 0 until width * height) {
+            val personConfidence = confidence.getFloat().coerceIn(0f, 1f)
+            outPixels[i] = blendPixel(sharpPixels[i], blurredPixels[i], personConfidence)
+        }
+
+        val result = Bitmap.createBitmap(outPixels, width, height, Bitmap.Config.ARGB_8888)
+        context.contentResolver.openOutputStream(uri, "wt")?.use { out ->
+            result.compress(Bitmap.CompressFormat.JPEG, 95, out)
+        }
+    } catch (exc: Exception) {
+        Log.e("CameraApp", "Failed to apply portrait background blur", exc)
+    } finally {
+        segmenter.close()
+    }
+}
+
+/** Wraps ML Kit's listener-based [Segmenter.process] as a suspend call. */
+private suspend fun segmentPerson(segmenter: Segmenter, image: InputImage): SegmentationMask =
+    suspendCancellableCoroutine { continuation ->
+        segmenter.process(image)
+            .addOnSuccessListener { mask -> if (continuation.isActive) continuation.resume(mask) }
+            .addOnFailureListener { exc -> if (continuation.isActive) continuation.resumeWithException(exc) }
+    }
+
+/**
+ * Cheap, dependency-free approximation of a gaussian blur: shrink the image way down (which
+ * mixes each pixel with its neighbors) and scale it back up with bilinear filtering. Far
+ * faster than a per-pixel convolution at full photo resolution and plenty soft-looking for a
+ * background blur.
+ */
+private fun downscaleBlur(source: Bitmap, factor: Int = 16): Bitmap {
+    val smallWidth = (source.width / factor).coerceAtLeast(1)
+    val smallHeight = (source.height / factor).coerceAtLeast(1)
+    val small = Bitmap.createScaledBitmap(source, smallWidth, smallHeight, true)
+    return Bitmap.createScaledBitmap(small, source.width, source.height, true)
+}
+
+/** Blends [sharp] and [blurred] ARGB pixels, weighted toward [sharp] by [personConfidence]. */
+private fun blendPixel(sharp: Int, blurred: Int, personConfidence: Float): Int {
+    val a = (sharp ushr 24) and 0xFF
+    val sr = (sharp ushr 16) and 0xFF
+    val sg = (sharp ushr 8) and 0xFF
+    val sb = sharp and 0xFF
+    val br = (blurred ushr 16) and 0xFF
+    val bg = (blurred ushr 8) and 0xFF
+    val bb = blurred and 0xFF
+    val r = (sr * personConfidence + br * (1f - personConfidence)).roundToInt().coerceIn(0, 255)
+    val g = (sg * personConfidence + bg * (1f - personConfidence)).roundToInt().coerceIn(0, 255)
+    val b = (sb * personConfidence + bb * (1f - personConfidence)).roundToInt().coerceIn(0, 255)
+    return (a shl 24) or (r shl 16) or (g shl 8) or b
 }
 
 /**

@@ -39,16 +39,40 @@ android {
 
     buildTypes {
         release {
-            // Signed with the auto-generated debug keystore so CI can produce an
-            // installable release APK without managing a production signing secret.
-            // Swap in a real keystore + Gradle signing secrets before any store distribution.
+            // Debug keystore keeps CI green — swap for a real keystore before store release.
             signingConfig = signingConfigs.getByName("debug")
-            isMinifyEnabled = false
+            // R8 full-mode: dead-code elimination + class merging + resource shrinking.
+            // Typically trims 1-3 MB on a Compose + CameraX + ML Kit app.
+            isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
         }
+    }
+
+    // One slim APK per CPU architecture instead of one fat universal APK.
+    // Each device only downloads the .so for its own ABI — cuts native-lib
+    // install footprint roughly in half for arm64-v8a and armeabi-v7a.
+    splits {
+        abi {
+            isEnable = true
+            reset()
+            include("arm64-v8a", "armeabi-v7a")
+            isUniversalApk = false
+        }
+    }
+
+    // Strip packaging metadata that inflates the APK with no runtime value.
+    packaging {
+        resources.excludes += setOf(
+            "META-INF/*.kotlin_module",
+            "META-INF/AL2.0",
+            "META-INF/LGPL2.1",
+            "DebugProbesKt.bin",
+            "kotlin-tooling-metadata.json",
+        )
     }
 
     compileOptions {
@@ -80,7 +104,7 @@ dependencies {
     implementation(platform(libs.compose.bom))
     implementation(libs.compose.ui)
     implementation(libs.compose.ui.graphics)
-    implementation(libs.compose.ui.tooling.preview)
+    debugImplementation(libs.compose.ui.tooling.preview)
     implementation(libs.compose.material3)
     implementation(libs.compose.material.icons.extended)
 

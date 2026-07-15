@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.AutoFixHigh
 import androidx.compose.material.icons.filled.BrandingWatermark
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material3.Icon
@@ -48,6 +49,8 @@ fun SettingsScreen(
     onScanDocumentsChanged: (Boolean) -> Unit,
     watermarkEnabled: Boolean,
     onWatermarkChanged: (Boolean) -> Unit,
+    smartEnhanceEnabled: Boolean,
+    onSmartEnhanceChanged: (Boolean) -> Unit,
     onBack: () -> Unit
 ) {
     Column(
@@ -99,6 +102,24 @@ fun SettingsScreen(
             subtitle = "Stamp the app name and date onto every photo you capture",
             checked = watermarkEnabled,
             onCheckedChange = onWatermarkChanged
+        )
+
+        Spacer(modifier = Modifier.height(24.dp))
+
+        Text(
+            text = "IMAGE QUALITY",
+            color = SecondaryText,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.Medium,
+            modifier = Modifier.padding(start = 4.dp, bottom = 8.dp)
+        )
+
+        SettingsToggleRow(
+            icon = Icons.Filled.AutoFixHigh,
+            title = "Smart Enhance",
+            subtitle = "Apply native post-processing after each capture: auto-levels, bilateral denoise, sharpening, and vibrance — all in compiled C, no cloud needed",
+            checked = smartEnhanceEnabled,
+            onCheckedChange = onSmartEnhanceChanged
         )
     }
 }

@@ -268,6 +268,7 @@ private fun CameraScreen() {
     var screen by remember { mutableStateOf(Screen.CAMERA) }
     var scanDocumentsEnabled by remember { mutableStateOf(SettingsPreferences.isScanDocumentsEnabled(context)) }
     var watermarkEnabled by remember { mutableStateOf(SettingsPreferences.isWatermarkEnabled(context)) }
+    var smartEnhanceEnabled by remember { mutableStateOf(SettingsPreferences.isSmartEnhanceEnabled(context)) }
 
     BackHandler(enabled = screen == Screen.SETTINGS) { screen = Screen.CAMERA }
 
@@ -279,6 +280,7 @@ private fun CameraScreen() {
                 CameraContent(
                     scanDocumentsEnabled = scanDocumentsEnabled,
                     watermarkEnabled = watermarkEnabled,
+                    smartEnhanceEnabled = smartEnhanceEnabled,
                     onOpenSettings = { screen = Screen.SETTINGS }
                 )
 
@@ -293,6 +295,11 @@ private fun CameraScreen() {
                         onWatermarkChanged = { enabled ->
                             watermarkEnabled = enabled
                             SettingsPreferences.setWatermarkEnabled(context, enabled)
+                        },
+                        smartEnhanceEnabled = smartEnhanceEnabled,
+                        onSmartEnhanceChanged = { enabled ->
+                            smartEnhanceEnabled = enabled
+                            SettingsPreferences.setSmartEnhanceEnabled(context, enabled)
                         },
                         onBack = { screen = Screen.CAMERA }
                     )
@@ -310,6 +317,7 @@ private fun CameraScreen() {
 private fun CameraContent(
     scanDocumentsEnabled: Boolean,
     watermarkEnabled: Boolean,
+    smartEnhanceEnabled: Boolean,
     onOpenSettings: () -> Unit
 ) {
     val context = LocalContext.current
@@ -610,6 +618,11 @@ private fun CameraContent(
                     }
                     if (watermarkEnabled) {
                         applyWatermark(context, uri)
+                    }
+                    // Smart Enhance: native post-processing pipeline applied last so it
+                    // works on the final pixel state (after crop, blur, and watermark).
+                    if (smartEnhanceEnabled) {
+                        applySmartEnhance(context, uri)
                     }
                     lastPhotoUri = uri
                     capturedPop = true
@@ -1786,6 +1799,45 @@ private suspend fun segmentPerson(segmenter: Segmenter, image: InputImage): Segm
     val upright = Bitmap.createBitmap(raw, 0, 0, raw.width, raw.height, matrix, true)
     raw.recycle()
     return upright
+}
+
+/**
+ * Smart Enhance — four-stage native post-processing pipeline applied after capture.
+ *
+ * Stage order matters:
+ *  1. Auto-levels first  — fixes per-channel exposure before we touch anything else.
+ *     Running it on a clipped or colour-casted image would distort downstream stages.
+ *  2. Bilateral denoise  — edge-preserving noise reduction on the level-corrected pixels.
+ *     Done before sharpening so we don't amplify noise that the sharpener would otherwise
+ *     dig up and make visible.
+ *  3. Unsharp mask       — recovers crispness lost in JPEG compression / sensor AA filter.
+ *     Applied after denoise so the detail it amplifies is genuine signal, not noise.
+ *  4. Vibrance           — light saturation lift, weighted toward under-saturated pixels.
+ *     Last because it should work on the final, spatially-processed values.
+ *
+ * The whole pipeline runs in compiled ARM C (libcamimg.so) without any cloud round-trip.
+ */
+private fun applySmartEnhance(context: Context, uri: Uri) {
+    try {
+        val original = decodeBitmapUpright(context, uri) ?: return
+        val bitmap = if (original.isMutable && original.config == Bitmap.Config.ARGB_8888) {
+            original
+        } else {
+            original.copy(Bitmap.Config.ARGB_8888, true)
+        }
+
+        NativeImaging.autoLevelsNative(bitmap, 0.005f)
+        NativeImaging.bilateralDenoiseNative(bitmap, radius = 2, sigmaColor = 25f, sigmaSpace = 10f)
+        NativeImaging.unsharpMaskNative(bitmap, radius = 1, strength = 0.55f)
+        NativeImaging.vibranceNative(bitmap, strength = 0.22f)
+
+        context.contentResolver.openOutputStream(uri, "wt")?.use { out ->
+            bitmap.compress(Bitmap.CompressFormat.JPEG, 95, out)
+        }
+        fixExifOrientation(context, uri)
+    } catch (exc: Exception) {
+        Log.e("CameraApp", "Smart Enhance failed", exc)
+    }
 }
 
 /**

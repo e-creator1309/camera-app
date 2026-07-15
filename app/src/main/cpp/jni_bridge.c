@@ -1,4 +1,9 @@
-/* jni_bridge.c — includes all translation units so CMake links one shared lib. */
+/* jni_bridge.c — aggregator: one shared library, all translation units. */
 #include "doc_warp.c"
 #include "portrait_blur.c"
 #include "zoom_smooth.c"
+#include "denoise.c"
+#include "sharpen.c"
+#include "histogram.c"
+#include "color_grade.c"
+#include "tone_curve.c"

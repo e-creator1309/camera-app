@@ -4,7 +4,8 @@ import android.content.Context
 
 private const val PREFS_NAME = "camera_app_settings"
 private const val KEY_SCAN_DOCUMENTS_ENABLED = "scan_documents_enabled"
-private const val KEY_WATERMARK_ENABLED = "watermark_enabled"
+private const val KEY_WATERMARK_ENABLED       = "watermark_enabled"
+private const val KEY_SMART_ENHANCE_ENABLED   = "smart_enhance_enabled"
 
 /** Thin, persisted wrapper around the app's settings so they survive app restarts. */
 object SettingsPreferences {
@@ -21,6 +22,18 @@ object SettingsPreferences {
 
     fun setWatermarkEnabled(context: Context, enabled: Boolean) {
         prefs(context).edit().putBoolean(KEY_WATERMARK_ENABLED, enabled).apply()
+    }
+
+    /**
+     * Smart Enhance runs a native post-processing pipeline on every captured photo:
+     * auto-levels → bilateral denoise → unsharp mask → vibrance boost.
+     * Off by default so users opt in rather than getting unexpected edits.
+     */
+    fun isSmartEnhanceEnabled(context: Context): Boolean =
+        prefs(context).getBoolean(KEY_SMART_ENHANCE_ENABLED, false)
+
+    fun setSmartEnhanceEnabled(context: Context, enabled: Boolean) {
+        prefs(context).edit().putBoolean(KEY_SMART_ENHANCE_ENABLED, enabled).apply()
     }
 
     private fun prefs(context: Context) =

@@ -9,6 +9,7 @@ plugins {
 
 android {
     namespace = "com.replit.cameraapp"
+    ndkVersion = "26.1.10909125"  // NDK r26b — pre-installed on GitHub ubuntu runners
     compileSdk = libs.versions.compile.sdk.version.get().toInt()
 
     defaultConfig {
@@ -19,9 +20,24 @@ android {
         versionName = "1.0.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-    }
 
-    buildTypes {
+          ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
+          externalNativeBuild {
+              cmake {
+                  arguments += "-DANDROID_STL=none"
+                  cFlags   += "-std=c11"
+              }
+          }
+      }
+
+      externalNativeBuild {
+          cmake {
+              path    = file("src/main/cpp/CMakeLists.txt")
+              version = "3.22.1"
+          }
+      }
+
+      buildTypes {
         release {
             // Signed with the auto-generated debug keystore so CI can produce an
             // installable release APK without managing a production signing secret.

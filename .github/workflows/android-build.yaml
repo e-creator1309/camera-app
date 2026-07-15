@@ -22,7 +22,12 @@ jobs:
           distribution: "zulu"
           java-version: "17"
 
-      - name: Setup Gradle
+      - name: Install NDK r26b
+          # Idempotent — skipped if already installed on the runner.
+          run: |
+            yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "ndk;26.1.10909125" 2>&1 | tail -3
+
+        - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
       - name: Run lint and unit tests

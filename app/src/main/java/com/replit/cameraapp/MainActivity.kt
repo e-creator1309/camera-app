@@ -1475,15 +1475,21 @@ private fun applyDocumentScanCrop(context: Context, uri: Uri, normalizedCorners:
             0f, outHeight.toFloat()
         )
 
-        val matrix = Matrix()
-        if (!matrix.setPolyToPoly(source, 0, destination, 0, 4)) return // degenerate quad -- keep original
+        // Forward matrix: source corners -> dest rectangle. Invert so native code
+        // maps each dest pixel back to its source coordinate for bilinear sampling.
+        val fwdMatrix = Matrix()
+        if (!fwdMatrix.setPolyToPoly(source, 0, destination, 0, 4)) return
+        val invMatrix = Matrix()
+        if (!fwdMatrix.invert(invMatrix)) return
+        val invValues = FloatArray(9); invMatrix.getValues(invValues)
 
         val straightened = Bitmap.createBitmap(outWidth, outHeight, Bitmap.Config.ARGB_8888)
-        AndroidCanvas(straightened).drawBitmap(original, matrix, Paint(Paint.FILTER_BITMAP_FLAG))
+        NativeImaging.warpDocumentNative(original, straightened, invValues)
 
         context.contentResolver.openOutputStream(uri, "wt")?.use { out ->
             straightened.compress(Bitmap.CompressFormat.JPEG, 95, out)
         }
+        fixExifOrientation(context, uri)
     } catch (exc: Exception) {
         Log.e("CameraApp", "Failed to apply document scan crop", exc)
     }
@@ -1526,6 +1532,9 @@ private fun applyWatermark(context: Context, uri: Uri) {
         context.contentResolver.openOutputStream(uri, "wt")?.use { out ->
             watermarked.compress(Bitmap.CompressFormat.JPEG, 95, out)
         }
+        // Bitmap.compress strips EXIF. Without this, MediaStore still serves the original
+        // ORIENTATION_ROTATE_90 tag on the newly-upright pixels -> photo appears 90° tilted.
+        fixExifOrientation(context, uri)
     } catch (exc: Exception) {
         Log.e("CameraApp", "Failed to apply watermark", exc)
     }
@@ -1565,7 +1574,9 @@ private suspend fun applyPortraitBackgroundBlur(context: Context, uri: Uri) {
             return
         }
 
-        val blurred = downscaleBlur(sharp)
+        // Full-resolution 3-pass box blur — sharper background edges than downscale trick.
+        val blurred = sharp.copy(Bitmap.Config.ARGB_8888, true)
+        NativeImaging.stackBlurNative(blurred, PORTRAIT_BLUR_RADIUS)
 
         val sharpPixels = IntArray(width * height)
         val blurredPixels = IntArray(width * height)
@@ -1574,16 +1585,15 @@ private suspend fun applyPortraitBackgroundBlur(context: Context, uri: Uri) {
 
         val confidence = mask.buffer
         confidence.rewind()
+        val confidenceArr = FloatArray(width * height) { confidence.getFloat().coerceIn(0f, 1f) }
         val outPixels = IntArray(width * height)
-        for (i in 0 until width * height) {
-            val personConfidence = confidence.getFloat().coerceIn(0f, 1f)
-            outPixels[i] = blendPixel(sharpPixels[i], blurredPixels[i], personConfidence)
-        }
+        NativeImaging.blendPixelsNative(sharpPixels, blurredPixels, confidenceArr, outPixels, width * height)
 
         val result = Bitmap.createBitmap(outPixels, width, height, Bitmap.Config.ARGB_8888)
         context.contentResolver.openOutputStream(uri, "wt")?.use { out ->
             result.compress(Bitmap.CompressFormat.JPEG, 95, out)
         }
+        fixExifOrientation(context, uri)
     } catch (exc: Exception) {
         Log.e("CameraApp", "Failed to apply portrait background blur", exc)
     } finally {
@@ -1605,27 +1615,8 @@ private suspend fun segmentPerson(segmenter: Segmenter, image: InputImage): Segm
  * faster than a per-pixel convolution at full photo resolution and plenty soft-looking for a
  * background blur.
  */
-private fun downscaleBlur(source: Bitmap, factor: Int = 16): Bitmap {
-    val smallWidth = (source.width / factor).coerceAtLeast(1)
-    val smallHeight = (source.height / factor).coerceAtLeast(1)
-    val small = Bitmap.createScaledBitmap(source, smallWidth, smallHeight, true)
-    return Bitmap.createScaledBitmap(small, source.width, source.height, true)
-}
-
-/** Blends [sharp] and [blurred] ARGB pixels, weighted toward [sharp] by [personConfidence]. */
-private fun blendPixel(sharp: Int, blurred: Int, personConfidence: Float): Int {
-    val a = (sharp ushr 24) and 0xFF
-    val sr = (sharp ushr 16) and 0xFF
-    val sg = (sharp ushr 8) and 0xFF
-    val sb = sharp and 0xFF
-    val br = (blurred ushr 16) and 0xFF
-    val bg = (blurred ushr 8) and 0xFF
-    val bb = blurred and 0xFF
-    val r = (sr * personConfidence + br * (1f - personConfidence)).roundToInt().coerceIn(0, 255)
-    val g = (sg * personConfidence + bg * (1f - personConfidence)).roundToInt().coerceIn(0, 255)
-    val b = (sb * personConfidence + bb * (1f - personConfidence)).roundToInt().coerceIn(0, 255)
-    return (a shl 24) or (r shl 16) or (g shl 8) or b
-}
+/* downscaleBlur + blendPixel removed — replaced by NativeImaging.stackBlurNative
+   and NativeImaging.blendPixelsNative (see portrait_blur.c). */
 
 /**
  * Decodes the JPEG at [uri] and returns a bitmap that is already rotated to the correct
@@ -1646,7 +1637,29 @@ private fun blendPixel(sharp: Int, blurred: Int, personConfidence: Float): Int {
  * after use.  The rotation matrix is applied via [Bitmap.createBitmap] so the returned
  * bitmap is a new, correctly-oriented copy; the original raw bitmap is recycled.
  */
-private fun decodeBitmapUpright(context: Context, uri: Uri): Bitmap? {
+/** Stack-blur radius for portrait background blur (pixels, full photo resolution). */
+    private const val PORTRAIT_BLUR_RADIUS = 40
+
+    /**
+    * Write EXIF ORIENTATION_NORMAL into the JPEG at [uri] after a Bitmap.compress() save.
+    * Bitmap.compress strips all EXIF tags — without this, the MediaStore continues to serve
+    * the stale ORIENTATION_ROTATE_90 it cached from the original file, causing photos to
+    * appear 90° tilted in every gallery app even though the pixels are already upright.
+    */
+    private fun fixExifOrientation(context: Context, uri: Uri) {
+      try {
+          context.contentResolver.openFileDescriptor(uri, "rw")?.use { pfd ->
+              val exif = ExifInterface(pfd.fileDescriptor)
+              exif.setAttribute(ExifInterface.TAG_ORIENTATION,
+                  ExifInterface.ORIENTATION_NORMAL.toString())
+              exif.saveAttributes()
+          }
+      } catch (e: Exception) {
+          Log.w("CameraApp", "Failed to fix EXIF orientation", e)
+      }
+    }
+
+    private fun decodeBitmapUpright(context: Context, uri: Uri): Bitmap? {
     // Pass 1: read EXIF orientation (reads only the header, not all pixel data).
     val exifOrientation = try {
         context.contentResolver.openInputStream(uri)?.use { stream ->

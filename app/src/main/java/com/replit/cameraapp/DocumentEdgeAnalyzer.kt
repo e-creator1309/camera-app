@@ -188,7 +188,7 @@ class DocumentEdgeAnalyzer(
         // that happens to share a brightness class but isn't really a rectangle.
         val quadAreaGrid = quadrilateralArea(topLeftGrid, topRightGrid, bottomRightGrid, bottomLeftGrid)
         val fillRatio = compXs.size.toFloat() / quadAreaGrid.coerceAtLeast(1f)
-        if (fillRatio < 0.45f) return null
+        if (fillRatio < 0.55f) return null
 
         fun toBufferPoint(grid: PointF): PointF = PointF(
             cropRect.left + grid.x * cropW / gridWidth.toFloat(),
@@ -206,7 +206,7 @@ class DocumentEdgeAnalyzer(
         val quadArea = quadrilateralArea(topLeft, topRight, bottomRight, bottomLeft)
         val frameArea = cropW.toFloat() * cropH.toFloat()
         val areaRatio = quadArea / frameArea
-        if (areaRatio < 0.12f || areaRatio > 0.97f) return null
+        if (areaRatio < 0.20f || areaRatio > 0.92f) return null
 
         val topSide = distance(topLeft, topRight)
         val rightSide = distance(topRight, bottomRight)
@@ -217,7 +217,7 @@ class DocumentEdgeAnalyzer(
         if (minSide < cropW * 0.08f) return null
         // A real sheet of paper or book cover doesn't have one side wildly longer than
         // another -- reject thin slivers this heuristic would otherwise happily box up.
-        if (maxSide / minSide > 3.2f) return null
+        if (maxSide / minSide > 2.5f) return null
         if (!isConvexQuad(topLeft, topRight, bottomRight, bottomLeft)) return null
 
         val rawCorners = listOf(topLeft, topRight, bottomRight, bottomLeft)
@@ -235,7 +235,11 @@ class DocumentEdgeAnalyzer(
         smoothedCorners = corners
 
         val previewPoints = mapToPreviewSpace(corners, cropRect, rotationDegrees) ?: return null
-        val normalizedCorners = normalizeUpright(corners, cropRect, rotationDegrees)
+        // Re-sort into true [TL, TR, BR, BL] visual order in upright space.
+        // normalizeUpright transforms coords but does NOT reorder — buffer-space
+        // "topLeft" is the visual top-right after a 90° phone rotation, causing
+        // the 180° document-crop flip reported by users.
+        val normalizedCorners = sortToTlTrBrBl(normalizeUpright(corners, cropRect, rotationDegrees))
 
         return DetectedDocument(previewPoints, normalizedCorners)
     }
@@ -437,6 +441,18 @@ class DocumentEdgeAnalyzer(
         points.forEachIndexed { i, p -> coords[i * 2] = p.x; coords[i * 2 + 1] = p.y }
         matrix.mapPoints(coords)
         return points.indices.map { i -> Offset(coords[i * 2], coords[i * 2 + 1]) }
+    }
+
+    /** Re-sorts four normalized (0..1) upright-space points into [TL, TR, BR, BL] visual order.
+     *  TL = min(x+y), BR = max(x+y), TR = max(x-y), BL = min(x-y). */
+    private fun sortToTlTrBrBl(corners: List<PointF>): List<PointF> {
+        if (corners.size != 4) return corners
+        val bySum = corners.sortedBy { it.x + it.y }
+        val tl = bySum[0]; val br = bySum[3]
+        val mid = listOf(bySum[1], bySum[2])
+        val tr = mid.maxByOrNull { it.x - it.y }!!
+        val bl = mid.minByOrNull { it.x - it.y }!!
+        return listOf(tl, tr, br, bl)
     }
 
     /** Rotates and normalizes points from buffer space into 0..1 fractions of the upright frame. */

@@ -22,6 +22,7 @@ import android.provider.MediaStore
 import android.util.Log
 import android.util.Rational
 import android.view.KeyEvent
+import android.view.OrientationEventListener
 import android.view.Surface as AndroidSurface
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -340,6 +341,17 @@ private fun CameraContent(
     var isRecording by remember { mutableStateOf(false) }
     var recordingSeconds by remember { mutableIntStateOf(0) }
 
+    // Physical device rotation — updated by OrientationEventListener below.
+    // The UI stays portrait-locked (manifest); this drives the capture
+    // targetRotation so the EXIF/container angle is correct even when the
+    // device is held sideways for a landscape shot or video.
+    var deviceRotation by remember { mutableIntStateOf(AndroidSurface.ROTATION_0) }
+
+    // Pinch-gesture target zoom.  The raw gesture updates this immediately;
+    // a native EMA smoothing loop (see LaunchedEffect below) steps the live
+    // zoomRatio toward it at ~30 fps so the camera HAL is never flooded.
+    var targetZoomRatio by remember { mutableFloatStateOf(1f) }
+
     // Requested the first time Video is selected, in case the initial permission prompt
     // (which also asks for it) was skipped because camera access was already granted from
     // a previous version of the app. Recording still works without it, just silently.
@@ -354,6 +366,26 @@ private fun CameraContent(
         }
     }
 
+    // Track physical device rotation so captured images and videos embed the
+    // correct orientation metadata even though the UI stays portrait-locked.
+    // Ranges: 0° = portrait-up, 90° = landscape-right, 180° = portrait-down,
+    // 270° = landscape-left (matching Surface.ROTATION_* conventions).
+    DisposableEffect(context) {
+        val listener = object : OrientationEventListener(context) {
+            override fun onOrientationChanged(orientation: Int) {
+                if (orientation == ORIENTATION_UNKNOWN) return
+                deviceRotation = when {
+                    orientation <= 45 || orientation > 315 -> AndroidSurface.ROTATION_0
+                    orientation in 46..135                 -> AndroidSurface.ROTATION_270
+                    orientation in 136..225                -> AndroidSurface.ROTATION_180
+                    else                                    -> AndroidSurface.ROTATION_90
+                }
+            }
+        }
+        listener.enable()
+        onDispose { listener.disable() }
+    }
+
     // Document scanning only runs on the back camera -- the front camera's mirrored preview
     // would need its own coordinate handling, and scanning a document via selfie camera isn't
     // a real use case, so this keeps the feature simple and correct rather than half-right.
@@ -366,12 +398,37 @@ private fun CameraContent(
     // pops up while pinching and lingers for ~2.5s after the last change before fading out,
     // instead of a permanently docked zoom row. A row of tap-to-select presets (0.5x-10x,
     // see ZoomPresetRow) sits alongside it for quick, discoverable jumps.
+    //
+    // Pinch events only update targetZoomRatio — the actual setZoomRatio call is made by the
+    // EMA smoothing loop below, which caps HAL calls to ~30fps.  Calling setZoomRatio on every
+    // raw gesture event (~120fps on most devices) starves the camera pipeline and drops frames.
     val zoomTransformableState = rememberTransformableState { zoomChange, _, _ ->
         if (zoomChange != 1f) {
-            val newZoom = (zoomRatio * zoomChange).coerceIn(minZoom, maxZoom)
-            zoomRatio = newZoom
-            camera?.cameraControl?.setZoomRatio(newZoom)
+            targetZoomRatio = (targetZoomRatio * zoomChange).coerceIn(minZoom, maxZoom)
             zoomIndicatorPulse += 1
+        }
+    }
+
+    // Native EMA zoom smoother — steps the live zoomRatio toward the pinch target at ~30fps.
+    // Each targetZoomRatio change restarts the effect, which is the rate-limiting mechanism:
+    // rapid pinch events keep restarting the coroutine, but only one setZoomRatio call goes
+    // out per 33ms window.  Once the gesture stops, the loop runs to completion and snaps
+    // to the exact target value so the zoom never drifts.
+    LaunchedEffect(targetZoomRatio, minZoom, maxZoom) {
+        while (true) {
+            val curr = zoomRatio
+            val target = targetZoomRatio
+            if (NativeImaging.isZoomSettledNative(curr, target, 0.005f)) {
+                if (curr != target) {
+                    zoomRatio = target
+                    camera?.cameraControl?.setZoomRatio(target)
+                }
+                break
+            }
+            val next = NativeImaging.lerpZoomNative(curr, target, 0.25f, minZoom, maxZoom)
+            zoomRatio = next
+            camera?.cameraControl?.setZoomRatio(next)
+            delay(33L) // ~30fps cap on HAL calls
         }
     }
 
@@ -381,6 +438,19 @@ private fun CameraContent(
             delay(2500)
             zoomIndicatorVisible = false
         }
+    }
+
+    // Keep the ImageCapture use case informed of device rotation so every JPEG
+    // is tagged with the correct EXIF orientation — even when the device is
+    // held sideways while the UI stays portrait-locked.
+    LaunchedEffect(deviceRotation, imageCapture) {
+        imageCapture.targetRotation = deviceRotation
+    }
+
+    // Same for VideoCapture: the mp4 container's rotation metadata is set from
+    // targetRotation, so landscape-held recordings play back the right way up.
+    LaunchedEffect(deviceRotation, videoCapture) {
+        videoCapture?.targetRotation = deviceRotation
     }
 
     var imageCapture by remember {
@@ -463,6 +533,7 @@ private fun CameraContent(
             videoCapture = newVideoCapture
             flashOn = false
             zoomRatio = 1f
+            targetZoomRatio = 1f
         } catch (exc: Exception) {
             Log.e("CameraApp", "Failed to bind camera use cases", exc)
         }
@@ -677,25 +748,18 @@ private fun CameraContent(
             )
         }
 
-        // Top-right: settings, timer, filter, and flash toggle all together in one row.
-        // statusBarsPadding() keeps this row clear of the status bar's network/battery icons
-        // on edge-to-edge displays, with a little extra room below that.
+        // Top-left: timer + settings.  Top-right: filter + flash.
+        // Splitting the four icons across both sides frees up viewfinder space and
+        // keeps the most-used controls (timer on the left, flash on the right) within
+        // natural thumb reach for each hand.
         Row(
             modifier = Modifier
-                .align(Alignment.TopEnd)
+                .align(Alignment.TopStart)
                 .statusBarsPadding()
-                .padding(top = 12.dp, end = 20.dp),
+                .padding(top = 12.dp, start = 20.dp),
             horizontalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            PressableIconButton(
-                onClick = {
-                    haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                    onOpenSettings()
-                }
-            ) {
-                Icon(Icons.Filled.Settings, contentDescription = "Settings", tint = Color.White)
-            }
-
+            // Timer — left side, first icon.
             PressableIconButton(
                 onClick = {
                     haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
@@ -728,6 +792,26 @@ private fun CameraContent(
                 }
             }
 
+            // Settings gear — left side, second icon.
+            PressableIconButton(
+                onClick = {
+                    haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                    onOpenSettings()
+                }
+            ) {
+                Icon(Icons.Filled.Settings, contentDescription = "Settings", tint = Color.White)
+            }
+        }
+
+        // Top-right: filter + flash.
+        Row(
+            modifier = Modifier
+                .align(Alignment.TopEnd)
+                .statusBarsPadding()
+                .padding(top = 12.dp, end = 20.dp),
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            // Filter — right side, first icon.
             PressableIconButton(
                 onClick = {
                     haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
@@ -741,8 +825,8 @@ private fun CameraContent(
                 )
             }
 
-            // Back camera needs a physical flash unit; front camera always offers the
-            // simulated screen-flash, so its button is never gated on hasFlashUnit().
+            // Flash — right side, second icon. Back camera needs a physical flash
+            // unit; front camera always offers simulated screen-flash.
             val flashAvailable = camera?.cameraInfo?.hasFlashUnit() == true ||
                 lensFacing == CameraSelector.LENS_FACING_FRONT
             AnimatedVisibility(
@@ -753,8 +837,6 @@ private fun CameraContent(
                 PressableIconButton(
                     onClick = {
                         haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                        // Flash no longer stays lit as a torch -- it only fires for the
-                        // instant a photo is captured, like a normal camera flash.
                         flashOn = !flashOn
                     }
                 ) {
@@ -817,6 +899,9 @@ private fun CameraContent(
                 onSelect = { level ->
                     haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                     val newZoom = level.coerceIn(minZoom, maxZoom)
+                    // Preset taps are instant — bypass smoothing by aligning
+                    // both values so the EMA loop sees nothing to animate.
+                    targetZoomRatio = newZoom
                     zoomRatio = newZoom
                     camera?.cameraControl?.setZoomRatio(newZoom)
                     zoomIndicatorPulse += 1

@@ -1,5 +1,6 @@
 /* jni_bridge.c — aggregator: one shared library, all translation units. */
 #include "doc_warp.c"
+#include "doc_scan.c"
 #include "portrait_blur.c"
 #include "zoom_smooth.c"
 #include "denoise.c"

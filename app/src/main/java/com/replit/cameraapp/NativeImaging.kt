@@ -6,6 +6,50 @@ import android.graphics.Bitmap
 object NativeImaging {
     init { System.loadLibrary("camimg") }
 
+    // ── doc_scan.c ────────────────────────────────────────────────────────────
+
+    /**
+     * Detect a document quadrilateral in a Y (luma) camera plane.
+     *
+     * Uses Sobel edge detection → Otsu binary edge map → BFS connected components →
+     * diagonal-extreme corner candidates → Bresenham edge-fit quality test (the key
+     * filter that rejects circles and organic shapes) → angle + area + convexity validation.
+     *
+     * @param yPlane    Raw bytes from `ImageProxy.planes[0].buffer`.
+     * @param rowStride Row stride in bytes (may be > width due to alignment padding).
+     * @param cropL/T   Top-left of the crop rect within the Y plane (from `image.cropRect`).
+     * @param cropW/H   Size of the crop rect.
+     * @param corners   Output [8] floats written as [tlX,tlY, trX,trY, brX,brY, blX,blY],
+     *                  each in [0..1] normalized to the crop-rect size.
+     * @return `true` if a valid document quad was found and [corners] was written.
+     */
+    external fun docScanFindQuadNative(
+        yPlane: ByteArray, rowStride: Int,
+        cropL: Int, cropT: Int, cropW: Int, cropH: Int,
+        corners: FloatArray
+    ): Boolean
+
+    /**
+     * Single EMA smoothing step: `out[i] = prev[i] + alpha * (curr[i] − prev[i])`.
+     *
+     * Call at ~8–12 fps with [alpha] ≈ 0.35 for stable tracking.
+     * Pass [alpha] = 1.0 to snap immediately (first detection or large jump).
+     */
+    external fun docScanSmoothCornersNative(
+        prev: FloatArray, curr: FloatArray,
+        alpha: Float,
+        out: FloatArray
+    )
+
+    /**
+     * Re-validate a smoothed normalized corner set.
+     *
+     * Checks convexity, area fraction, and interior angles in frame-pixel space.
+     * Use after [docScanSmoothCornersNative] to confirm EMA hasn't drifted the
+     * corners into an invalid shape before drawing or using them.
+     */
+    external fun docScanIsValidQuadNative(corners: FloatArray, frameW: Int, frameH: Int): Boolean
+
     // ── doc_warp.c ────────────────────────────────────────────────────────────
 
     /** Perspective-warp [srcBitmap] into [dstBitmap] using a 9-float inverse homography. */

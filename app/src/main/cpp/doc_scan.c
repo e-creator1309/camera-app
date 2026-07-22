@@ -99,10 +99,19 @@
 
 /* How many Sobel magnitude points to use for perimeter-relative thresholding.
  * The Otsu multiplier nudges the threshold toward strong-edge-only.        */
-#define OTSU_NUDGE    1.25f
+/* Nudge reduced from 1.25 → 1.05: the original value was too aggressive and
+ * discarded weak-but-real page-boundary edges (white notebook on light
+ * background), leaving only the strong spiral-binding edges in g_bin.    */
+#define OTSU_NUDGE    1.05f
 
 /* Maximum components to evaluate (the N largest ones).                     */
 #define MAX_CANDS     8
+
+/* Bounding-box aspect ratio guard: min(bboxW,bboxH)/max(bboxW,bboxH) must
+ * exceed this.  Rejects tall narrow strips (spiral binding, door frames)
+ * that otherwise pass area, angle, and convexity checks.  0.25 means the
+ * narrower dimension must be ≥ 25 % of the longer one.                     */
+#define MIN_BBOX_RATIO 0.25f
 
 /* ── Data types ─────────────────────────────────────────────────────────── */
 
@@ -325,6 +334,25 @@ static int is_valid_doc(const ds_comp *c, float quality) {
     float area = quad_area(c);
     float areaFrac = area / (float)SCAN_N;
     if (areaFrac < MIN_AREA_FRAC || areaFrac > MAX_AREA_FRAC) return 0;
+
+    /* Reject strips (spiral binding, narrow bands): bounding box must not be
+     * extremely elongated.  Compute axis-aligned bbox of the 4 corners.      */
+    {
+        int xv[4] = {c->tlX, c->trX, c->brX, c->blX};
+        int yv[4] = {c->tlY, c->trY, c->brY, c->blY};
+        int xmn = xv[0], xmx = xv[0], ymn = yv[0], ymx = yv[0];
+        for (int k = 1; k < 4; k++) {
+            if (xv[k] < xmn) xmn = xv[k];
+            if (xv[k] > xmx) xmx = xv[k];
+            if (yv[k] < ymn) ymn = yv[k];
+            if (yv[k] > ymx) ymx = yv[k];
+        }
+        int bboxW = xmx - xmn, bboxH = ymx - ymn;
+        float bboxRatio = (bboxW < bboxH)
+            ? (float)bboxW / (float)(bboxH > 0 ? bboxH : 1)
+            : (float)bboxH / (float)(bboxW > 0 ? bboxW : 1);
+        if (bboxRatio < MIN_BBOX_RATIO) return 0;
+    }
 
     float scanDiag = sqrtf((float)(SCAN_W*SCAN_W + SCAN_H*SCAN_H));
     float minSide = MIN_SIDE_FRAC * scanDiag;

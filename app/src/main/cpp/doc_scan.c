@@ -99,10 +99,12 @@
 
 /* How many Sobel magnitude points to use for perimeter-relative thresholding.
  * The Otsu multiplier nudges the threshold toward strong-edge-only.        */
-/* Nudge reduced from 1.25 → 1.05: the original value was too aggressive and
- * discarded weak-but-real page-boundary edges (white notebook on light
- * background), leaving only the strong spiral-binding edges in g_bin.    */
-#define OTSU_NUDGE    1.05f
+/* Nudge reduced from 1.25 → 1.05 → 1.00: Otsu already finds the optimal
+ * edge/non-edge split; multiplying it further only discards weak-but-real
+ * page-boundary edges (e.g. dark textbook cover against a dark background).
+ * The spiral-binding false-positive is now stopped by MIN_BBOX_RATIO, so we
+ * no longer need the nudge to do that work.                                */
+#define OTSU_NUDGE    1.00f
 
 /* Maximum components to evaluate (the N largest ones).                     */
 #define MAX_CANDS     8
@@ -112,6 +114,14 @@
  * that otherwise pass area, angle, and convexity checks.  0.25 means the
  * narrower dimension must be ≥ 25 % of the longer one.                     */
 #define MIN_BBOX_RATIO 0.25f
+
+/* Interior luma guard: mean luma of a sample grid centred on the quad must
+ * exceed this to be accepted.  Rejects opaque dark objects (phone face-down,
+ * black bag, backpack) that have clean rectangular edges but pitch-dark
+ * interiors.  Paper/card reflects ambient light → luma ≥ ~40; a dark phone
+ * screen is typically ≤ 15.  Threshold set conservatively so dark-covered
+ * textbooks (luma ≈ 30–60) still pass.                                     */
+#define MIN_INTERIOR_LUMA 22
 
 /* ── Data types ─────────────────────────────────────────────────────────── */
 
@@ -327,6 +337,28 @@ static int is_convex(const ds_comp *c) {
     return sign != 0;
 }
 
+/* Interior luma check: sample a 5×5 grid centred on the quad centroid and
+ * compute mean g_luma.  Returns 0 if the interior is pitch-dark (opaque
+ * object, not paper).  Spacing 4 px covers ±8 px around the centroid —
+ * well inside any realistic document quad in scan space.                   */
+static int interior_luma_ok(const ds_comp *c) {
+    int cx = (c->tlX + c->trX + c->brX + c->blX) >> 2;
+    int cy = (c->tlY + c->trY + c->brY + c->blY) >> 2;
+    long sum = 0;
+    int  cnt = 0;
+    for (int dy = -8; dy <= 8; dy += 4) {
+        for (int dx = -8; dx <= 8; dx += 4) {
+            int nx = cx + dx, ny = cy + dy;
+            if ((unsigned)nx < (unsigned)SCAN_W &&
+                (unsigned)ny < (unsigned)SCAN_H) {
+                sum += g_luma[ny * SCAN_W + nx];
+                cnt++;
+            }
+        }
+    }
+    return cnt == 0 || (int)(sum / cnt) >= MIN_INTERIOR_LUMA;
+}
+
 /* Full validity check for a candidate component. */
 static int is_valid_doc(const ds_comp *c, float quality) {
     if (!is_convex(c)) return 0;
@@ -334,6 +366,10 @@ static int is_valid_doc(const ds_comp *c, float quality) {
     float area = quad_area(c);
     float areaFrac = area / (float)SCAN_N;
     if (areaFrac < MIN_AREA_FRAC || areaFrac > MAX_AREA_FRAC) return 0;
+
+    /* Reject opaque dark objects (phone face-down, black bag, etc.) whose
+     * rectangular outline scores well but whose interior is pitch-dark.     */
+    if (!interior_luma_ok(c)) return 0;
 
     /* Reject strips (spiral binding, narrow bands): bounding box must not be
      * extremely elongated.  Compute axis-aligned bbox of the 4 corners.      */

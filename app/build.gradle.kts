@@ -116,6 +116,7 @@ dependencies {
     implementation(libs.coil.compose)
 
     implementation(libs.mlkit.segmentation.selfie)
+    implementation(libs.mlkit.doc.scanner)
 
     debugImplementation(libs.compose.ui.tooling)
 

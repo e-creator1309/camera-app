@@ -1,6 +1,6 @@
-/* jni_bridge.c — aggregator: one shared library, all translation units. */
+/* jni_bridge.c — aggregator: one shared library, all C translation units.
+ * doc_scan.cpp is compiled separately by CMake (requires C++ / OpenCV). */
 #include "doc_warp.c"
-#include "doc_scan.c"
 #include "portrait_blur.c"
 #include "zoom_smooth.c"
 #include "denoise.c"

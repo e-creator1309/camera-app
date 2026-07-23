@@ -23,7 +23,8 @@ android {
 
         externalNativeBuild {
             cmake {
-                arguments += "-DANDROID_STL=none"
+                // c++_shared required by OpenCV (replaces 'none')
+                arguments += "-DANDROID_STL=c++_shared"
                 cFlags   += "-std=c11"
             }
         }
@@ -80,7 +81,8 @@ android {
     }
 
     buildFeatures {
-        compose = true
+        compose  = true
+        prefab   = true   // expose native libs from OpenCV AAR to CMake
     }
 
     lint {
@@ -117,6 +119,7 @@ dependencies {
 
     implementation(libs.mlkit.segmentation.selfie)
     implementation(libs.mlkit.doc.scanner)
+    implementation("org.opencv:opencv:4.10.0")
 
     debugImplementation(libs.compose.ui.tooling)
 

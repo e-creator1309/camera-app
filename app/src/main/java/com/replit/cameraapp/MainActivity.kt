@@ -52,6 +52,11 @@ import com.google.mlkit.vision.segmentation.Segmentation
 import com.google.mlkit.vision.segmentation.SegmentationMask
 import com.google.mlkit.vision.segmentation.Segmenter
 import com.google.mlkit.vision.segmentation.selfie.SelfieSegmenterOptions
+import android.app.Activity
+import androidx.activity.result.IntentSenderRequest
+import com.google.mlkit.vision.documentscanner.GmsDocumentScannerOptions
+import com.google.mlkit.vision.documentscanner.GmsDocumentScanning
+import com.google.mlkit.vision.documentscanner.GmsDocumentScanningResult
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.RepeatMode
@@ -194,7 +199,8 @@ private enum class CaptureMode(val label: String) {
     PHOTO("PHOTO"),
     VIDEO("VIDEO"),
     PORTRAIT("PORTRAIT"),
-    MORE("MORE")
+    MORE("MORE"),
+    SCAN("SCAN")
 }
 
 /** Which full-screen page is currently shown over the camera preview. */
@@ -372,6 +378,36 @@ private fun CameraContent(
         ) {
             audioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
         }
+    }
+
+    // ── ML Kit Document Scanner ──────────────────────────────────────────────
+    val mlScannerOptions = GmsDocumentScannerOptions.Builder()
+        .setScannerMode(GmsDocumentScannerOptions.SCANNER_MODE_FULL)
+        .setGalleryImportAllowed(false)
+        .setResultFormats(GmsDocumentScannerOptions.RESULT_FORMAT_JPEG)
+        .build()
+
+    val mlScannerLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartIntentSenderForResult()
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK) {
+            val scanResult = GmsDocumentScanningResult.fromActivityResultIntent(result.data)
+            scanResult?.pages?.forEach { page ->
+                saveScanToGallery(context, page.imageUri)
+            }
+        }
+    }
+
+    val launchMlScanner: () -> Unit = {
+        val activity = context as Activity
+        GmsDocumentScanning.getClient(mlScannerOptions)
+            .getStartScanIntent(activity)
+            .addOnSuccessListener { intentSender ->
+                mlScannerLauncher.launch(IntentSenderRequest.Builder(intentSender).build())
+            }
+            .addOnFailureListener { e ->
+                Log.e("CameraApp", "ML Kit scanner failed to start", e)
+            }
     }
 
     // Track physical device rotation so captured images and videos embed the
@@ -705,7 +741,11 @@ private fun CameraContent(
     }
 
     val onShutterClick: () -> Unit = {
-        if (captureMode == CaptureMode.VIDEO) startOrStopRecording() else performCapture()
+        when (captureMode) {
+            CaptureMode.VIDEO -> startOrStopRecording()
+            CaptureMode.SCAN  -> launchMlScanner()
+            else              -> performCapture()
+        }
     }
     val currentShutterClick by rememberUpdatedState(onShutterClick)
 
@@ -1837,6 +1877,35 @@ private fun applySmartEnhance(context: Context, uri: Uri) {
         fixExifOrientation(context, uri)
     } catch (exc: Exception) {
         Log.e("CameraApp", "Smart Enhance failed", exc)
+    }
+}
+
+/**
+ * Copies a scanned-document JPEG produced by ML Kit into the device's
+ * DCIM/Camera folder so it appears in the gallery alongside regular photos.
+ */
+private fun saveScanToGallery(context: Context, sourceUri: Uri) {
+    val displayName = "SCAN_${System.currentTimeMillis()}.jpg"
+    val values = ContentValues().apply {
+        put(MediaStore.Images.Media.DISPLAY_NAME, displayName)
+        put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+        put(MediaStore.Images.Media.RELATIVE_PATH, "DCIM/Camera")
+    }
+    val resolver = context.contentResolver
+    val destUri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+    if (destUri == null) {
+        Log.e("CameraApp", "saveScanToGallery: could not create MediaStore entry")
+        return
+    }
+    try {
+        resolver.openInputStream(sourceUri)?.use { input ->
+            resolver.openOutputStream(destUri)?.use { output ->
+                input.copyTo(output)
+            }
+        }
+    } catch (e: Exception) {
+        Log.e("CameraApp", "saveScanToGallery: copy failed", e)
+        resolver.delete(destUri, null, null)
     }
 }
 
